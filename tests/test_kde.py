@@ -186,12 +186,15 @@ class Teardown(unittest.TestCase):
 
 
 class Capture(unittest.TestCase):
-    def test_pipeline_letterboxes_to_1080p30_in_420_and_writes_mpegts(self):
+    def test_pipeline_letterboxes_to_1080p_in_420_and_writes_mpegts(self):
         cmd = helper.capture_pipeline(7, 42, helper.ENCODERS[3])
         text = " ".join(cmd)
         self.assertIn("pipewiresrc fd=7 path=42", text)
         self.assertIn("videoscale add-borders=true", text)
-        self.assertIn("video/x-raw,format=I420,width=1920,height=1080,pixel-aspect-ratio=1/1,framerate=30/1", cmd)
+        self.assertIn("video/x-raw,format=I420,width=1920,height=1080,pixel-aspect-ratio=1/1", cmd)
+        # A frame is never held back waiting for the next one.
+        self.assertNotIn("videorate", cmd)
+        self.assertIn("keepalive-time=100", cmd)
         self.assertIn("x264enc tune=zerolatency", text)
         self.assertEqual(cmd[-6:], ["!", "mpegtsmux", "!", "fdsink", "fd=1", "sync=false"])
 
