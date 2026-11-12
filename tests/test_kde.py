@@ -186,18 +186,24 @@ class Teardown(unittest.TestCase):
 
 
 class Capture(unittest.TestCase):
-    def test_pipeline_letterboxes_to_1080p30_and_writes_mpegts_to_the_socket(self):
-        cmd = helper.capture_pipeline(7, 42, 9, helper.ENCODERS[3])
+    def test_pipeline_letterboxes_to_1080p30_in_420_and_writes_mpegts(self):
+        cmd = helper.capture_pipeline(7, 42, helper.ENCODERS[3])
         text = " ".join(cmd)
         self.assertIn("pipewiresrc fd=7 path=42", text)
         self.assertIn("videoscale add-borders=true", text)
-        self.assertIn("video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1,framerate=30/1", cmd)
+        self.assertIn("video/x-raw,format=I420,width=1920,height=1080,pixel-aspect-ratio=1/1,framerate=30/1", cmd)
         self.assertIn("x264enc tune=zerolatency", text)
-        self.assertEqual(cmd[-6:], ["!", "mpegtsmux", "!", "fdsink", "fd=9", "sync=false"])
+        self.assertEqual(cmd[-6:], ["!", "mpegtsmux", "!", "fdsink", "fd=1", "sync=false"])
 
-    def test_every_encoder_line_is_plain_arguments(self):
+    def test_every_encoder_takes_420(self):
         for enc in helper.ENCODERS:
+            self.assertIn(enc.split()[0], ("I420", "NV12"))
             self.assertEqual(shlex.split(enc), enc.split())
+
+    def test_publishing_copies_the_stream_to_rtsp_over_tcp(self):
+        cmd = helper.publish_command("rtsp://u:p@127.0.0.1:8554/live")
+        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
+        self.assertEqual(cmd[-5:], ["-f", "rtsp", "-rtsp_transport", "tcp", "rtsp://u:p@127.0.0.1:8554/live"])
 
 
 class Clipboard(unittest.TestCase):

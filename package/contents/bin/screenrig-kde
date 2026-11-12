@@ -918,10 +918,13 @@ def mediamtx_secret(value):
     return json.dumps("sha256:" + base64.b64encode(hashlib.sha256(value.encode()).digest()).decode())
 
 
-def mediamtx_config(user, password, socket_path):
-    """Reading `live` takes this cast's login. The picture comes only from the capture on this computer, over
-    a Unix socket in this user's private state folder, and nobody may publish: no other program here can put
-    its own picture on the screens. The login is stored hashed, so the file holds nothing to read back."""
+def mediamtx_config(user, password, publisher):
+    """Reading `live` takes this cast's login. Publishing takes the cast's second login (`publisher`, a user
+    and password) and comes from this computer, and a publisher is never replaced: no other program here can
+    put its own picture on the screens. Both logins are stored hashed, so the file holds nothing to read back.
+
+    The capture publishes over RTSP, so the stream's description carries a session name: Android's Media3
+    rejects the empty `s= ` mediamtx writes for other sources."""
     os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
     path = os.path.join(LIVE_DIR, "mediamtx.yml")
     write_private(path, (
@@ -929,19 +932,21 @@ def mediamtx_config(user, password, socket_path):
         "api: no\nmetrics: no\npprof: no\nplayback: no\n"
         "rtsp: yes\nrtspAddress: :%d\nrtspTransports: [tcp]\nrtspEncryption: \"no\"\n"
         "rtmp: no\n"
-        "hls: no\nwebrtc: no\nsrt: no\n"
+        "hls: no\nwebrtc: no\nsrt: no\nmoq: no\n"
         "authMethod: internal\n"
         "authInternalUsers:\n"
+        "  - user: %s\n    pass: %s\n    ips: [\"127.0.0.1\", \"::1\"]\n"
+        "    permissions:\n      - action: publish\n        path: live\n"
         "  - user: %s\n    pass: %s\n    ips: []\n"
         "    permissions:\n      - action: read\n        path: live\n"
-        "paths:\n  live:\n    source: %s\n"
-        % (LIVE_PORT, mediamtx_secret(user), mediamtx_secret(password), json.dumps("unix+mpegts://" + socket_path))))
+        "paths:\n  live:\n    overridePublisher: no\n"
+        % (LIVE_PORT, mediamtx_secret(publisher[0]), mediamtx_secret(publisher[1]),
+           mediamtx_secret(user), mediamtx_secret(password))))
     return path
 
 
 def live_url(host, user, password):
-    return "rtsp://%s:%d/live" % (host, LIVE_PORT) if user is None else \
-        "rtsp://%s:%s@%s:%d/live" % (user, password, host, LIVE_PORT)
+    return "rtsp://%s:%s@%s:%d/live" % (user, password, host, LIVE_PORT)
 
 
 # The firewall: firewalld (Fedora, openSUSE) or ufw (Kubuntu, KDE neon). The rule
@@ -1311,12 +1316,11 @@ def live_start(source, screens, minutes, label):
     logs = os.path.join(CACHE, "live")
     os.makedirs(logs, exist_ok=True)
     user, password = secrets.token_hex(8), secrets.token_hex(16)
-    sock = os.path.join(LIVE_DIR, "ts.sock")
-    if os.path.exists(sock):
-        os.remove(sock)
+    publisher = (secrets.token_hex(8), secrets.token_hex(16))
     if source not in LIVE_SOURCES:
         raise Problem("Unknown live source %s" % source)
-    server = subprocess.Popen([mediamtx_binary(), mediamtx_config(user, password, sock)],
+    # Run in the private live folder: whatever mediamtx writes stays there.
+    server = subprocess.Popen([mediamtx_binary(), mediamtx_config(user, password, publisher)], cwd=LIVE_DIR,
                               stdout=open(os.path.join(logs, "mediamtx.log"), "w"),
                               stderr=subprocess.STDOUT, start_new_session=True)
     # `screens` holds the screens whose takeover this cast placed. `unsure` holds those asked to take it whose
@@ -1325,8 +1329,10 @@ def live_start(source, screens, minutes, label):
              "started_at": time.time(), "url": live_url(ip, user, password)}
     started = False
     try:
-        # Plasma's own screen-share dialog asks which screen or window, as it does for any other app.
-        recorder = subprocess.Popen(SELF + ["live-capture", source, sock],
+        # Plasma's own screen-share dialog asks which screen or window, as it does for any other app. The
+        # publishing address reaches the capture in its environment, which only this user can read.
+        recorder = subprocess.Popen(SELF + ["live-capture", source],
+                                    env=dict(os.environ, SCREENRIG_PUBLISH=live_url("127.0.0.1", *publisher)),
                                     stdout=open(os.path.join(logs, "recorder.log"), "w"), stderr=subprocess.STDOUT,
                                     start_new_session=True)
         state["recorder_pid"] = recorder.pid
@@ -1388,13 +1394,14 @@ def live_start(source, screens, minutes, label):
 # Stop ends the cast) and feeds GStreamer's H.264 into mediamtx's socket.
 
 PORTAL = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
-# Hardware first; each is tried once on this computer and the first that encodes is kept.
+# Hardware first; each is tried once on this computer and the first that encodes is kept. Each takes 4:2:0
+# input, so the stream is a profile every Player's hardware decoder plays (never High 4:4:4).
 ENCODERS = [
-    "vah264lpenc rate-control=cbr bitrate=6000 key-int-max=30 target-usage=7",
-    "vah264enc rate-control=cbr bitrate=6000 key-int-max=30 target-usage=7",
-    "nvh264enc bitrate=6000 gop-size=30 zerolatency=true",
-    "x264enc tune=zerolatency speed-preset=veryfast bitrate=6000 key-int-max=30",
-    "openh264enc bitrate=6000000 rate-control=bitrate gop-size=30 complexity=low usage-type=screen",
+    "NV12 vah264lpenc rate-control=cbr bitrate=6000 key-int-max=30 target-usage=7",
+    "NV12 vah264enc rate-control=cbr bitrate=6000 key-int-max=30 target-usage=7",
+    "NV12 nvh264enc bitrate=6000 gop-size=30 zerolatency=true",
+    "I420 x264enc tune=zerolatency speed-preset=veryfast bitrate=6000 key-int-max=30",
+    "I420 openh264enc bitrate=6000000 rate-control=bitrate gop-size=30 complexity=low usage-type=screen",
 ]
 
 
@@ -1411,8 +1418,9 @@ def h264_encoder():
     if not shutil.which("gst-launch-1.0"):
         raise Problem("Live casting uses GStreamer: install gstreamer1 and its PipeWire plugin.")
     for enc in ENCODERS:
-        probe = ["gst-launch-1.0", "-q", "videotestsrc", "num-buffers=5", "!", "video/x-raw,width=640,height=360",
-                 "!", "videoconvert", "!"] + enc.split() + ["!", "fakesink"]
+        fmt, element = enc.split(None, 1)
+        probe = ["gst-launch-1.0", "-q", "videotestsrc", "num-buffers=5", "!", "videoconvert", "!",
+                 "video/x-raw,format=%s,width=640,height=360" % fmt, "!"] + element.split() + ["!", "fakesink"]
         try:
             if subprocess.run(probe, capture_output=True, timeout=20).returncode == 0:
                 os.makedirs(CACHE, exist_ok=True)
@@ -1424,21 +1432,35 @@ def h264_encoder():
     raise Problem("GStreamer has no H.264 encoder here: install gstreamer1-plugin-openh264 or a VA-API driver.")
 
 
-def capture_pipeline(pw_fd, node, out_fd, encoder):
-    """gst-launch arguments: the portal's PipeWire stream, 1920x1080 at 30 fps (letterboxed), H.264 in MPEG-TS."""
+def capture_pipeline(pw_fd, node, encoder):
+    """gst-launch arguments: the portal's PipeWire stream, 1920x1080 at 30 fps (letterboxed) in 4:2:0, as
+    H.264 in MPEG-TS on stdout."""
+    fmt, element = encoder.split(None, 1)
     return (["gst-launch-1.0", "-e", "-q",
              "pipewiresrc", "fd=%d" % pw_fd, "path=%d" % node, "do-timestamp=true", "keepalive-time=1000",
              "always-copy=true", "!", "videoconvert", "!", "videoscale", "add-borders=true", "!", "videorate", "!",
-             "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1,framerate=30/1", "!",
-             "queue", "max-size-buffers=2", "leaky=downstream", "!"] + encoder.split() +
-            ["!", "h264parse", "config-interval=-1", "!", "mpegtsmux", "!", "fdsink", "fd=%d" % out_fd, "sync=false"])
+             "video/x-raw,format=%s,width=1920,height=1080,pixel-aspect-ratio=1/1,framerate=30/1" % fmt, "!",
+             "queue", "max-size-buffers=2", "leaky=downstream", "!"] + element.split() +
+            ["!", "h264parse", "config-interval=-1", "!", "mpegtsmux", "!", "fdsink", "fd=1", "sync=false"])
 
 
-def live_capture(source, sock_path):
+def publish_command(url):
+    """ffmpeg arguments: the MPEG-TS on stdin, unchanged, published to mediamtx over RTSP."""
+    return ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-fflags", "nobuffer", "-probesize", "500000",
+            "-analyzeduration", "500000", "-f", "mpegts", "-i", "pipe:0", "-c", "copy", "-an",
+            "-f", "rtsp", "-rtsp_transport", "tcp", url]
+
+
+def live_capture(source):
     import gi
     gi.require_version("Gio", "2.0")
     from gi.repository import Gio, GLib
 
+    url = os.environ.pop("SCREENRIG_PUBLISH", "")
+    if not url:
+        raise Problem("live-capture runs only from live-start.")
+    if not shutil.which("ffmpeg"):
+        raise Problem("Live casting uses ffmpeg: install it from Discover.")
     encoder = h264_encoder()
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     sender = bus.get_unique_name()[1:].replace(".", "_")
@@ -1461,7 +1483,8 @@ def live_capture(source, sock_path):
                       Gio.DBusCallFlags.NONE, -1, None)
         timer = GLib.timeout_add_seconds(timeout_s, loop.quit)
         loop.run()
-        GLib.source_remove(timer) if answer else None
+        if answer:
+            GLib.source_remove(timer)
         bus.signal_unsubscribe(sub)
         if not answer:
             raise Problem("The screen-share dialog did not answer.")
@@ -1494,37 +1517,39 @@ def live_capture(source, sock_path):
                                                  GLib.Variant("(oa{sv})", (session, {})), GLib.VariantType("(h)"),
                                                  Gio.DBusCallFlags.NONE, -1, None, None)
     pw_fd = fds.get(reply.unpack()[0])
-    out = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    deadline = time.time() + 10
-    while True:
-        try:
-            out.connect(sock_path)
-            break
-        except OSError:
-            if time.time() > deadline:
-                raise Problem("The stream server did not open its socket.")
-            time.sleep(0.2)
-    gst = subprocess.Popen(capture_pipeline(pw_fd, node, out.fileno(), encoder), pass_fds=(pw_fd, out.fileno()))
+    gst = subprocess.Popen(capture_pipeline(pw_fd, node, encoder), pass_fds=(pw_fd,), stdout=subprocess.PIPE)
     os.close(pw_fd)
-    out.close()
+    ffmpeg = subprocess.Popen(publish_command(url), stdin=gst.stdout)
+    gst.stdout.close()
+    children = (gst, ffmpeg)
     result = {"code": 0}
 
     def stop(*_):
         if gst.poll() is None:
-            gst.send_signal(signal.SIGINT)
-            GLib.timeout_add_seconds(3, lambda: gst.poll() is None and gst.kill())
+            gst.send_signal(signal.SIGINT)  # -e: the encoder finishes, then ffmpeg sees the end of its input
+        GLib.timeout_add_seconds(3, lambda: [p.kill() for p in children if p.poll() is None] and False)
         return True
 
-    def gst_exited(_pid, status):
-        result["code"] = 0 if os.waitstatus_to_exitcode(status) in (0, -signal.SIGINT) else 1
-        loop.quit()
+    def exited(_pid, status):
+        if os.waitstatus_to_exitcode(status) not in (0, -signal.SIGINT, 255):
+            result["code"] = 1
+        if all(p.poll() is not None for p in children):
+            loop.quit()
+        else:
+            stop()  # one half ended: end the other
 
     # Stop in Plasma's sharing indicator closes the session.
     bus.signal_subscribe(PORTAL[0], "org.freedesktop.portal.Session", "Closed", session, None,
                          Gio.DBusSignalFlags.NO_MATCH_RULE, lambda *a: stop())
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, stop)
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, stop)
-    GLib.child_watch_add(GLib.PRIORITY_DEFAULT, gst.pid, gst_exited)
+    try:
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except ImportError:  # PyGObject before 3.52
+        signal_add = GLib.unix_signal_add
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal_add(GLib.PRIORITY_DEFAULT, sig, stop)
+    for proc in children:
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, proc.pid, exited)
     loop.run()
     try:
         bus.call_sync(PORTAL[0], session, "org.freedesktop.portal.Session", "Close", None, None,
@@ -2046,7 +2071,7 @@ def main(argv):
             show_notice(json.loads(args[0]))
             return 0
         if cmd == "live-capture":
-            return live_capture(args[0], args[1])
+            return live_capture(args[0])
         if cmd == "snapshot":
             emit(snapshot())
             return 0

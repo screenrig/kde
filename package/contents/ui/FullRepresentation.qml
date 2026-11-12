@@ -866,10 +866,10 @@ PlasmaExtras.Representation {
             y: Kirigami.Units.smallSpacing
             radius: height / 2
             color: Kirigami.Theme.negativeTextColor
-            width: liveLabel.implicitWidth + Kirigami.Units.largeSpacing
-            height: liveLabel.implicitHeight + Kirigami.Units.smallSpacing
+            width: livePill.implicitWidth + Kirigami.Units.largeSpacing
+            height: livePill.implicitHeight + Kirigami.Units.smallSpacing
             PlasmaComponents3.Label {
-              id: liveLabel
+              id: livePill
               anchors.centerIn: parent
               text: "LIVE"
               color: "white"

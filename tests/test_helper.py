@@ -212,7 +212,7 @@ class LiveCastStart(unittest.TestCase):
             with self.subTest(source=source):
                 self.start(source=source)
                 capture = [cmd for cmd, _ in self.children if cmd[0] == "capture"][-1]
-                self.assertEqual(capture[-3:], ["live-capture", source, self.live_file("ts.sock")])
+                self.assertEqual(capture[-2:], ["live-capture", source])
                 # Time for a person to choose in the dialog.
                 self.assertEqual(self.waits[-1], helper.PICK_WAIT_S)
                 helper.live_stop()
@@ -313,13 +313,20 @@ class LiveCastStart(unittest.TestCase):
         self.assertNotEqual(first, second)
         helper.live_stop()
 
-    def test_reading_needs_the_login_and_nobody_publishes(self):
-        self.start()
+    def test_reading_needs_the_login_and_only_this_machine_publishes(self):
+        envs = []
+        fake = helper.subprocess.Popen
+
+        def popen(cmd, **kw):
+            if "live-capture" in cmd:
+                envs.append(kw.get("env") or {})
+            return fake(cmd, **kw)
+        with mock.patch.object(helper.subprocess, "Popen", popen):
+            self.start()
         user, password = self.login(self.playlist_url())
         with open(self.live_file("mediamtx.yml")) as f:
             text = f.read()
         self.assertEqual(stat.S_IMODE(os.stat(self.live_file("mediamtx.yml")).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(helper.LIVE_DIR).st_mode), 0o700)
         for secret in (user, password):
             self.assertNotIn(secret, text)
 
@@ -327,15 +334,27 @@ class LiveCastStart(unittest.TestCase):
             return "sha256:" + base64.b64encode(hashlib.sha256(value.encode()).digest()).decode()
         self.assertIn(digest(user), text)
         self.assertIn(digest(password), text)
-        # The picture comes only over the socket in the private live folder.
-        self.assertIn(json.dumps("unix+mpegts://" + self.live_file("ts.sock")), text)
+        # The capture publishes over loopback with the cast's second login, handed over in its environment.
+        capture = next(cmd for cmd, _ in self.children if cmd[0] == "capture")
+        self.assertFalse([arg for arg in capture if "rtsp://" in arg])
+        sent = re.fullmatch(r"rtsp://([0-9a-f]{16}):([0-9a-f]{32})@127\.0\.0\.1:8554/live", envs[0]["SCREENRIG_PUBLISH"])
+        self.assertTrue(sent, "the capture publishes with a random login")
+        self.assertNotIn(sent.group(1), (user, password))
+        for secret in sent.groups():
+            self.assertNotIn(secret, text)
         if yaml:
             conf = yaml.safe_load(text)
             self.assertEqual(conf["authMethod"], "internal")
-            (reader,) = conf["authInternalUsers"]
+            # Only RTSP listens: no MoQ, WebRTC, HLS, SRT or RTMP port is opened.
+            for proto in ("moq", "webrtc", "hls", "srt", "rtmp", "api", "metrics", "pprof", "playback"):
+                self.assertIs(conf[proto], False, proto)
+            local, reader = conf["authInternalUsers"]
+            self.assertEqual((local["user"], local["pass"], local["ips"]),
+                             (digest(sent.group(1)), digest(sent.group(2)), ["127.0.0.1", "::1"]))
+            self.assertIs(conf["paths"]["live"]["overridePublisher"], False)
+            self.assertEqual(local["permissions"], [{"action": "publish", "path": "live"}])
             self.assertEqual((reader["user"], reader["pass"], reader["ips"]), (digest(user), digest(password), []))
             self.assertEqual(reader["permissions"], [{"action": "read", "path": "live"}])
-            self.assertEqual(conf["paths"]["live"]["source"], "unix+mpegts://" + self.live_file("ts.sock"))
         helper.live_stop()
 
     def test_login_is_kept_only_in_the_private_state_until_the_cast_ends(self):
