@@ -86,14 +86,15 @@ portal's configuration or remember a choice.
 - Spectacle for region captures, kdialog for files, and wl-clipboard for
   images on the clipboard (links work without it).
 - Live casting: GStreamer with its PipeWire plugin and an H.264 encoder (VA-API,
-  NVENC, x264 or OpenH264; the widget uses the first that works). On the first
-  cast the widget downloads [mediamtx](https://github.com/bluenviron/mediamtx)
-  v1.21.3, checks it against the SHA-256 pinned in its source and keeps it in
-  `~/.local/share/screenrig-kde/bin`; it serves RTSP over TCP on port 8554.
-  Each cast has its own random login, which the screens receive in the stream
-  address. The picture reaches mediamtx only through a socket in your private
-  state folder, and nothing can publish to it over the network. Screens reach
-  it on the same network: Android and Linux Players.
+  NVENC, x264 or OpenH264; the widget uses the first that works), and ffmpeg.
+  On the first cast the widget downloads
+  [mediamtx](https://github.com/bluenviron/mediamtx) v1.21.3, checks it against
+  the SHA-256 pinned in its source and keeps it in
+  `~/.local/share/screenrig-kde/bin`; it serves RTSP over TCP on port 8554 and
+  nothing else. Each cast has its own random login, which the screens receive
+  in the stream address, and a second one that publishing needs, used only by
+  the capture on this computer. Screens reach it on the same network: Android
+  and Linux Players.
 
 ## Development
 
