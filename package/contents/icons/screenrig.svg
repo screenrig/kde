@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">screenRIG</title>
+  <desc id="desc">An amber screen with a sloping inner corner and two white agent eyes.</desc>
+  <path id="screen" fill="#F8B334" fill-rule="evenodd" d="M40 40H216Q240 40 240 64V192Q240 216 216 216H40Q16 216 16 192V64Q16 40 40 40Z M108 60H220V168Q220 196 192 196H36V154L86 72Q94 60 108 60Z"/>
+  <path id="face" fill="#2A3547" d="M108 60H220V168Q220 196 192 196H36V154L86 72Q94 60 108 60Z"/>
+  <path id="eyes" fill="#FFFFFF" d="M114 118A14 14 0 1 1 86 118A14 14 0 1 1 114 118Z M180 118A14 14 0 1 1 152 118A14 14 0 1 1 180 118Z"/>
+</svg>

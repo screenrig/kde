@@ -1,0 +1,2132 @@
+#!/usr/bin/env python3
+"""screenRIG for KDE Plasma: the helper behind the screenRIG widget.
+
+Every command prints one JSON line on stdout ({"ok": bool, ...}). `serve`
+follows the project in the background (snapshot, event stream,
+notifications) and `wait` hands the widget what changed.
+"""
+
+import base64
+import fcntl
+import glob
+import hashlib
+import http.client
+import ipaddress
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+APP = "screenrig-kde"
+PLUGIN_ID = "ai.screenrig.plasma"
+HOME = os.path.expanduser("~")
+SELF = [sys.executable, os.path.realpath(__file__)]
+CONFIG = os.environ.get("SCREENRIG_CONFIG") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "screenrig", "config.json")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), APP)
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), APP)
+DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), APP)
+APPS = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "applications")
+DASHBOARD = "https://screenrig.ai/dashboard"
+RENEW_MARGIN_S = 120
+
+_print_lock = threading.Lock()
+
+
+class Problem(Exception):
+    """An API or local failure with a message a person can act on."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+class Uncertain(Problem):
+    """No usable answer came back, so the request may still have been applied."""
+
+
+def why(err):
+    """An error with its causes, outermost first, for the log."""
+    parts = []
+    while err is not None and len(parts) < 6:
+        parts.append(str(err) or type(err).__name__)
+        err = err.__cause__
+    return ": ".join(parts)
+
+
+def emit(obj):
+    with _print_lock:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+
+def warn(msg):
+    with _print_lock:
+        sys.stderr.write(APP + ": " + msg + "\n")
+        sys.stderr.flush()
+
+
+# ---------------------------------------------------------------- config/auth
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise Problem("Not signed in: %s is missing. Run `screenrig login`." % CONFIG)
+
+
+def token_exp(token):
+    try:
+        part = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        return float(claims.get("exp", 0))
+    except Exception:
+        return 0.0
+
+
+# Where each agent keeps the installed screenRIG plugin, and how to install it there.
+PLUGIN_CACHES = {
+    "claude": os.path.join(HOME, ".claude", "plugins", "cache", "screenrig", "screenrig"),
+    "codex": os.path.join(HOME, ".codex", "plugins", "cache", "screenrig", "screenrig"),
+    "grok": os.path.join(HOME, ".grok", "installed-plugins"),
+}
+PLUGIN_SOURCE = "https://github.com/screenrig/plugin.git"
+PLUGIN_INSTALL = {
+    "claude": [["claude", "plugin", "marketplace", "add", PLUGIN_SOURCE, "--scope", "user"],
+               ["claude", "plugin", "install", "screenrig@screenrig", "--scope", "user"]],
+    "codex": [["codex", "plugin", "marketplace", "add", PLUGIN_SOURCE, "--ref", "main", "--json"],
+              ["codex", "plugin", "add", "screenrig@screenrig", "--json"]],
+    "grok": [["grok", "plugin", "install", PLUGIN_SOURCE + "#plugins/screenrig", "--trust"]],
+}
+AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok"}
+
+
+def plugin_dirs(agent):
+    """Plugin roots, excluding marketplace downloads and other plugins."""
+    cache = PLUGIN_CACHES.get(agent)
+    if not cache:
+        return []
+    pattern = "screenrig-*" if agent == "grok" else "*"
+    return glob.glob(os.path.join(cache, pattern))
+
+
+def installed_plugin_dirs(agent):
+    return [path for path in plugin_dirs(agent)
+            if os.path.isfile(os.path.join(path, "skills", "screenrig", "SKILL.md"))]
+
+
+def panel_agent():
+    """Prefer the default agent's installed integration, then any installed one."""
+    preferred = default_agent()
+    available = [agent for agent in PLUGIN_CACHES if shutil.which(agent)]
+    ordered = ([preferred] if preferred in available else []) + [agent for agent in available if agent != preferred]
+    return next((agent for agent in ordered if installed_plugin_dirs(agent)),
+                ordered[0] if ordered else preferred)
+
+
+def cli_command():
+    """The screenRIG CLI: $SCREENRIG_CLI, the newest bundled plugin CLI, then `screenrig` on PATH."""
+    env = os.environ.get("SCREENRIG_CLI")
+    if env:
+        return env.split()
+    bundled = sorted((os.path.join(root, "cli", "dist", "bin.js") for agent in PLUGIN_CACHES
+                      for root in plugin_dirs(agent)
+                      if os.path.isfile(os.path.join(root, "cli", "dist", "bin.js"))),
+                     key=cli_version)
+    node = shutil.which("node")
+    if bundled and node:
+        return [node, bundled[-1]]
+    path = shutil.which("screenrig")
+    return [path] if path else None
+
+
+def cli_version(path):
+    root = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+    version = os.path.basename(root)
+    # Grok names installations with a hash, keeping the version in the manifest.
+    try:
+        with open(os.path.join(root, ".claude-plugin", "plugin.json")) as f:
+            version = json.load(f).get("version") or version
+    except (OSError, ValueError):
+        pass
+    return [int(x) if x.isdigit() else 0 for x in version.split(".")]
+
+
+def renew_token():
+    """The CLI owns the refresh family (lock, rotation, recovery); a free call makes it renew."""
+    cmd = cli_command()
+    if not cmd:
+        raise Problem("The screenRIG CLI is not installed, so the sign-in cannot be renewed. Install the screenRIG plugin.")
+    proc = subprocess.run(cmd + ["billing", "balance", "--json"], capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        detail = (proc.stdout or proc.stderr or "").strip().splitlines()
+        raise Problem("Renewing the sign-in failed: %s" % (detail[-1] if detail else "exit %d" % proc.returncode))
+
+
+def run_cli(args, timeout=60):
+    """Run the screenRIG CLI with --json and return its data, or raise its problem."""
+    cmd = cli_command()
+    if not cmd:
+        raise Problem("The screenRIG CLI is not installed. Install the screenRIG plugin.")
+    proc = subprocess.run(cmd + args + ["--json"], capture_output=True, text=True, timeout=timeout)
+    try:
+        envelope = json.loads(proc.stdout)
+    except ValueError:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise Problem(detail[-1] if detail else "The CLI exited with %d" % proc.returncode)
+    if not envelope.get("ok"):
+        problem = envelope.get("problem") or envelope.get("error") or {}
+        raise Problem(problem.get("detail") or problem.get("title") or "The CLI refused: %s" % " ".join(args))
+    return envelope.get("data") or {}
+
+
+def list_projects():
+    cfg = load_config()
+    current = cfg.get("project_id")
+    data = run_cli(["project", "list"])
+    out = []
+    for row in data.get("projects") or []:
+        p = row.get("project") or {}
+        org = row.get("organization") or {}
+        out.append({"id": p.get("id"), "name": p.get("name") or p.get("id"), "organization": org.get("name", ""),
+                    "organization_id": org.get("id", ""), "screens": p.get("screen_count", 0),
+                    "current": p.get("id") == current})
+    out.sort(key=lambda r: (r["organization"].lower(), r["name"].lower()))
+    return out
+
+
+def onboarding():
+    """Use an installed agent integration; offer installation only when needed."""
+    agent = panel_agent()
+    plugin = bool(installed_plugin_dirs(agent))
+    try:
+        cfg = load_config()
+        signed_in = bool(cfg.get("token") or cfg.get("identity_token"))
+    except (Problem, ValueError):
+        signed_in = False
+    return {"ok": True, "agent": agent, "agent_name": AGENT_NAMES.get(agent, agent),
+            "installable": agent in PLUGIN_INSTALL and bool(shutil.which(PLUGIN_INSTALL[agent][0][0])),
+            "plugin": plugin, "cli": cli_command() is not None, "signed_in": signed_in}
+
+
+def install_plugin():
+    """Install the official screenRIG plugin into the selected available agent, when asked."""
+    agent = panel_agent()
+    steps = PLUGIN_INSTALL.get(agent)
+    if not steps:
+        raise Problem("Install the screenRIG plugin for %s from %s" % (agent, PLUGIN_SOURCE.removesuffix(".git")))
+    if not shutil.which(steps[0][0]):
+        raise Problem("%s is not on PATH" % steps[0][0])
+    for step in steps:
+        proc = subprocess.run(step, capture_output=True, text=True, timeout=300)
+        out = (proc.stdout + proc.stderr).lower()
+        if proc.returncode != 0 and "already" not in out:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            raise Problem("Plugin install failed: %s" % (detail[-1] if detail else "%s exited %d" % (step[0], proc.returncode)))
+    if cli_command() is None:
+        raise Problem("The plugin is installed, but its CLI needs Node.js (node on PATH)")
+    return "Installed the screenRIG plugin for %s" % AGENT_NAMES.get(agent, agent)
+
+
+def login_start():
+    """Ask for a person's approval in the dashboard; opens the approval page with its code."""
+    data = run_cli(["login", "--no-wait"])
+    pending = data.get("login") or data
+    url = pending.get("verification_uri_complete") or pending.get("verification_uri")
+    if url:
+        open_url(url)
+    return {"ok": True, "login": pending.get("login_id") or pending.get("id"), "code": pending.get("user_code", ""),
+            "url": url or ""}
+
+
+def login_wait(login):
+    """Wait for the approval; the CLI stores the sign-in and selects the approved project."""
+    run_cli(["login", "--resume", login], timeout=24 * 3600)
+    cfg = load_config()
+    return "Added %s" % (cfg.get("project_name") or "the project")
+
+
+def use_project(project):
+    data = run_cli(["project", "use", project])
+    name = ((data.get("project") or {}).get("name")) or project
+    return "Switched to %s" % name
+
+
+def access_token(force=False):
+    cfg = load_config()
+    token = cfg.get("token") or cfg.get("identity_token")
+    if force or not token or token_exp(token) - time.time() < RENEW_MARGIN_S:
+        if not cfg.get("oauth") and token:
+            return cfg, token
+        renew_token()
+        cfg = load_config()
+        token = cfg.get("token") or cfg.get("identity_token")
+    if not token:
+        raise Problem("Not signed in. Run `screenrig login`.")
+    return cfg, token
+
+
+def project_id(cfg):
+    pid = cfg.get("project_id")
+    if not pid:
+        raise Problem("No project is selected. Run `screenrig project select`.")
+    return pid
+
+
+# ---------------------------------------------------------------------- HTTP
+
+CREDITS = {}
+
+
+def _note_credits(headers):
+    low = headers.get("ScreenRig-Credits-Low")
+    if low is not None:
+        CREDITS["low"] = low == "true"
+        try:
+            CREDITS["remaining"] = int(headers.get("ScreenRig-Credits-Remaining") or 0)
+        except ValueError:
+            pass
+
+
+def error_body(err):
+    """An HTTP error answer's body; empty when the connection dropped while it was read."""
+    try:
+        return err.read().decode(errors="replace")
+    except (http.client.HTTPException, OSError):
+        return ""
+
+
+def problem_message(status, body):
+    try:
+        p = json.loads(body)
+        return p.get("detail") or p.get("title") or ("HTTP %d" % status)
+    except Exception:
+        return "HTTP %d" % status
+
+
+def api(method, path, body=None, idempotent=False, raw=False, headers=None, retry=None):
+    """One API call. A keyed call (idempotent=True) whose answer is lost is sent once more with the same
+    Idempotency-Key, so a change the first try made is answered again instead of made twice; retry=True does
+    the same for a read. Raises Uncertain when neither try got a usable answer."""
+    h = dict(headers or {})
+    if idempotent:
+        h.setdefault("Idempotency-Key", "kde-" + secrets.token_hex(16))
+    again = idempotent if retry is None else retry
+    for attempt in (1, 2):
+        try:
+            return _send(method, path, body, raw, h)
+        except Uncertain as err:
+            if attempt == 2 or not again:
+                raise
+            warn("%s %s: %s; trying once more" % (method, path, why(err)))
+            time.sleep(1)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A request that carries the sign-in is never redirected: the API does not redirect, and following one
+    would hand the sign-in to wherever it points. Downloads and uploads carry none and follow as usual."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.has_header("Authorization"):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+urllib.request.install_opener(urllib.request.build_opener(NoRedirect))
+
+
+def api_base(cfg):
+    """The API origin: https, or plain http only on this machine (a local stack)."""
+    base = cfg.get("api_url", "https://api.screenrig.ai").rstrip("/")
+    parts = urllib.parse.urlsplit(base)
+    if parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1")):
+        return base
+    raise Problem("The screenRIG sign-in names an API address that is not https: %s" % base)
+
+
+def _send(method, path, body, raw, headers, _retried=False):
+    cfg, token = access_token()
+    url = api_base(cfg) + path
+    h = {"Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": APP}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        h["Content-Type"] = "application/json"
+    h.update(headers)
+    req = urllib.request.Request(url, data=data, method=method, headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            _note_credits(resp.headers)
+            payload = resp.read()
+            if raw:
+                return payload, resp.headers
+            return json.loads(payload) if payload else {}
+    except urllib.error.HTTPError as err:
+        payload = error_body(err)
+        if err.code == 401 and not _retried and "invalid_token" in (err.headers.get("WWW-Authenticate") or ""):
+            access_token(force=True)
+            return _send(method, path, body, raw, headers, _retried=True)
+        message = problem_message(err.code, payload)
+        # A gateway or server failure can follow a change that was applied.
+        raise (Uncertain if err.code >= 500 else Problem)(message, err.code)
+    except urllib.error.URLError as err:
+        raise Uncertain("Cannot reach screenRIG: %s" % err.reason) from err
+    except (http.client.HTTPException, OSError, ValueError) as err:
+        # A body cut short, a reset or timeout while reading it, or a 200 that is not JSON.
+        raise Uncertain("screenRIG sent an incomplete or unreadable answer: %s" % (str(err) or type(err).__name__)) from err
+
+
+def paged(path):
+    items, cursor = [], None
+    while True:
+        sep = "&" if "?" in path else "?"
+        page = api("GET", path + (sep + "after=" + urllib.parse.quote(cursor) if cursor else ""))
+        items.extend(page.get("items") or [])
+        cursor = page.get("next_cursor")
+        if not cursor:
+            return items
+
+
+# ------------------------------------------------------------------ snapshot
+
+def shot_path(screen_id):
+    return os.path.join(CACHE, "shots", screen_id + ".webp")
+
+
+def summarize_screen(s, names):
+    eff = s.get("effective_playlist") or {}
+    display = s.get("display") or {}
+    host = s.get("host") or {}
+    upgrade = s.get("manifest_upgrade") or {}
+    takeover = s.get("takeover") or {}
+    path = shot_path(s["id"])
+    return {
+        "id": s["id"],
+        "label": s.get("label") or s["id"],
+        "online": bool(s.get("online")),
+        "state": s.get("state"),
+        "last_seen_at": s.get("last_seen_at"),
+        "last_online_at": s.get("last_online_at"),
+        "playlist_id": s.get("playlist_id"),
+        "playlist_name": names.get(s.get("playlist_id"), ""),
+        "playing_id": eff.get("id"),
+        "playing_name": names.get(eff.get("id"), (upgrade.get("active_playlist") or {}).get("name", "")),
+        "playing_source": eff.get("source", ""),
+        "playing_until": eff.get("until"),
+        "takeover_until": takeover.get("until") if takeover else None,
+        "has_takeover": bool(takeover),
+        "display_off": display.get("requested") == "off",
+        "suspended": bool(s.get("suspension")),
+        "upgrade_state": upgrade.get("state", ""),
+        "platform": host.get("platform") or (s.get("player") or {}).get("kind", ""),
+        "capabilities": host.get("capabilities") or [],
+        "shot": path if os.path.exists(path) else "",
+        "shot_mtime": int(os.path.getmtime(path)) if os.path.exists(path) else 0,
+    }
+
+
+SAFE_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def safe_ids(items):
+    """Ids end up in menu commands, file names and API paths: keep only items whose id is a plain token."""
+    return [item for item in items if SAFE_ID.fullmatch(str(item.get("id") or ""))]
+
+
+def snapshot():
+    cfg, _ = access_token()
+    pid = project_id(cfg)
+    if not SAFE_ID.fullmatch(pid):
+        raise Problem("The screenRIG sign-in names a project id that is not valid.")
+    playlists = safe_ids(paged("/api/playlists?project=" + pid))
+    names = {p["id"]: p.get("name") or p["id"] for p in playlists}
+    screens = [summarize_screen(s, names) for s in safe_ids(paged("/api/screens?project=" + pid))
+               if s.get("state") == "active"]
+    screens.sort(key=lambda s: (not s["online"], s["label"].lower()))
+    return {
+        "kind": "snapshot",
+        "at": time.time(),
+        "project": {"id": pid, "name": cfg.get("project_name", ""), "organization": cfg.get("organization_name", "")},
+        "screens": screens,
+        "playlists": [{"id": p["id"], "name": names[p["id"]], "approved": p.get("approved_revision") is not None}
+                      for p in sorted(playlists, key=lambda p: names[p["id"]].lower())],
+        "credits": dict(CREDITS),
+    }
+
+
+def fetch_shot(screen_id, fresh=False):
+    os.makedirs(os.path.dirname(shot_path(screen_id)), exist_ok=True)
+    capture = ""
+    if fresh:
+        started = api("POST", "/api/screens/%s/screenshot" % screen_id, idempotent=True)
+        capture = started.get("capture_id", "")
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            status = api("GET", "/api/screens/%s/screenshot/status" % screen_id)
+            if status.get("state") == "ready":
+                break
+            if status.get("state") in ("timed_out", "unavailable"):
+                raise Problem("The screen did not return a screenshot (%s)." % status.get("state"))
+            time.sleep(1)
+    q = "?capture_id=" + urllib.parse.quote(capture) if capture else ""
+    data, _ = api("GET", "/api/screens/%s/screenshot%s" % (screen_id, q), raw=True,
+                  headers={"Accept": "image/webp"})
+    tmp = shot_path(screen_id) + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, shot_path(screen_id))
+    return shot_path(screen_id)
+
+
+def fetch_all_shots(screens):
+    """Latest stored screenshots (credit-exempt) for screens whose copy is older than ten minutes."""
+    for s in screens:
+        path = shot_path(s["id"])
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < 600:
+            continue
+        try:
+            fetch_shot(s["id"])
+        except Problem:
+            pass
+
+
+# ------------------------------------------------------------------- actions
+
+def iso_in(minutes):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + minutes * 60))
+
+
+def screen_action(screen_id, action, arg=None):
+    base = "/api/screens/" + screen_id
+    if action == "reload":
+        api("POST", base + "/reload", {}, idempotent=True)
+        return "Reload sent"
+    if action == "reboot":
+        api("POST", base + "/reboot", {}, idempotent=True)
+        return "Reboot sent"
+    if action == "restart-app":
+        api("POST", base + "/restart-app", {}, idempotent=True)
+        return "App restart sent"
+    if action == "display-off":
+        api("POST", base + "/display", {"power": "off"}, idempotent=True)
+        return "Display off"
+    if action == "display-on":
+        api("DELETE", base + "/display", idempotent=True)
+        return "Display back on"
+    if action == "switch":
+        api("PATCH", base, {"playlist_id": arg}, idempotent=True)
+        return "Playlist switched"
+    if action == "override":
+        playlist, minutes = arg.split(":", 1)
+        api("POST", base + "/takeover", {"playlist_id": playlist, "until": iso_in(int(minutes)),
+                                          "reason": "Override from KDE Plasma"}, idempotent=True)
+        return "Override for %s min" % minutes
+    if action == "end-override":
+        api("DELETE", base + "/takeover", idempotent=True)
+        return "Override ended"
+    if action == "shot":
+        fetch_shot(screen_id, fresh=True)
+        return "Screenshot updated"
+    raise Problem("Unknown action %s" % action)
+
+
+def upload_media(path):
+    cfg, _ = access_token()
+    pid = project_id(cfg)
+    ctype = mimetypes.guess_type(path)[0] or ""
+    allowed = {"image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "video/webm"}
+    if ctype not in allowed:
+        raise Problem("screenRIG shows PNG, JPEG, WebP, GIF, MP4 and WebM files; %s is %s." % (
+            os.path.basename(path), ctype or "an unknown type"))
+    with open(path, "rb") as f:
+        data = f.read()
+    digest = hashlib.sha256(data).hexdigest()
+    start = api("POST", "/api/projects/%s/media/uploads" % pid,
+                {"filename": os.path.basename(path), "content_type": ctype, "bytes": len(data), "sha256": digest},
+                idempotent=True)
+    put = urllib.request.Request(start["upload_url"], data=data, method=start.get("method", "PUT"),
+                                 headers=start.get("headers") or {})
+    try:
+        urllib.request.urlopen(put, timeout=300).read()
+    except urllib.error.HTTPError as err:
+        raise Problem("Upload refused: HTTP %d" % err.code)
+    op = api("POST", "/api/media/uploads/%s/commit" % start["id"],
+             {"content_type": ctype, "bytes": len(data), "sha256": digest}, idempotent=True)
+    deadline = time.time() + 300
+    while op.get("state") not in ("succeeded", "failed", "cancelled") and time.time() < deadline:
+        time.sleep(1)
+        op = api("GET", "/api/operations/" + op["id"])
+    if op.get("state") != "succeeded":
+        raise Problem("Processing %s failed: %s" % (os.path.basename(path),
+                                                    (op.get("error") or {}).get("detail") or op.get("state")))
+    return op["result"]["media_id"], ctype
+
+
+def media_page(media_id, ctype):
+    video = ctype.startswith("video/")
+    return {
+        "id": "p1",
+        "canvas": {"width": 1920, "height": 1080, "background": "#000000FF"},
+        "transition": {"type": "crossfade", "duration_ms": 500},
+        "advance": {"mode": "media_end"} if video else {"mode": "duration", "after_ms": 60000},
+        "primitives": [{"id": "m", "primitive": "video" if video else "image",
+                        "selector": {"by": "id", "media_id": media_id},
+                        "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                        "layer": 0, "content_fit": "contain"}],
+    }
+
+
+def send(screens, minutes, url=None, path=None):
+    remember_cast(screens=screens)
+    cfg, _ = access_token()
+    pid = project_id(cfg)
+    if not screens:
+        raise Problem("Pick at least one screen.")
+    if url:
+        res = api("POST", "/api/projects/%s/tab-shares" % pid,
+                  {"screen_ids": screens, "tabs": [{"url": url}], "until": iso_in(min(minutes, 1440))},
+                  idempotent=True)
+        skipped = res.get("skipped") or []
+        warnings = [w.get("code", w) if isinstance(w, dict) else w for w in res.get("warnings") or []]
+        msg = "Showing %s on %d screen(s) for %d min" % (url, len(res.get("screens") or screens) - len(skipped), minutes)
+        if "embedding_blocked" in json.dumps(warnings):
+            msg += "; the site refuses to be framed"
+        if skipped:
+            msg += "; %d skipped (no default playlist)" % len(skipped)
+        return msg
+    media_id, ctype = upload_media(path)
+    name = "Sent from %s: %s" % (socket.gethostname(), os.path.basename(path))
+    playlist = api("POST", "/api/projects/%s/playlists" % pid,
+                   {"name": name[:120], "pages": [media_page(media_id, ctype)]}, idempotent=True)
+    if playlist.get("state") == "pending_review" or "id" not in playlist:
+        raise Problem("The playlist waits for a person's review before it can play.")
+    failed = []
+    for sid in screens:
+        try:
+            api("POST", "/api/screens/%s/takeover" % sid,
+                {"playlist_id": playlist["id"], "until": iso_in(minutes), "reason": "Sent from KDE Plasma"},
+                idempotent=True)
+        except Problem as err:
+            failed.append("%s: %s" % (sid, err))
+    if failed and len(failed) == len(screens):
+        raise Problem("; ".join(failed))
+    return "Showing %s on %d screen(s) for %d min%s" % (
+        os.path.basename(path), len(screens) - len(failed), minutes, "; failed " + "; ".join(failed) if failed else "")
+
+
+# ------------------------------------------------------------------ desktop
+#
+# The widget is the panel; everything else goes through freedesktop parts that
+# every Plasma desktop has: notify-send, Spectacle, kdialog and the portals.
+
+ICON = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "icons", "screenrig.svg")
+SUMMON = os.path.join(STATE, "summon.json")
+NOTICES = os.path.join(STATE, "notices")
+
+
+def default_agent():
+    """The agent the person picked for the panel, else Claude Code."""
+    return os.environ.get("SCREENRIG_AGENT") or "claude"
+
+
+def open_url(url):
+    if not str(url).startswith("https://"):
+        raise Problem("Not opening an address that is not https: %s" % url)
+    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return url
+
+
+def summon_panel(payload):
+    """Ask the widget to open on a view; it picks this up on its next wait."""
+    os.makedirs(STATE, exist_ok=True)
+    write_private(SUMMON, json.dumps({"at": time.time(), "payload": payload}))
+
+
+def notify(title, body="", urgency="normal", actions=(), tag=None):
+    """A desktop notification. With actions, a detached helper waits for the click and runs the chosen one;
+    a tagged notification can be closed later (close_notice)."""
+    spec = {"title": title, "body": body, "urgency": urgency, "actions": [[label, list(argv)] for label, argv in actions[:3]],
+            "tag": tag or ""}
+    try:
+        subprocess.Popen(SELF + ["notice", json.dumps(spec)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as err:
+        warn("could not raise a notification: %s" % why(err))
+
+
+def notice_command(spec):
+    """notify-send's arguments for a notification spec."""
+    cmd = ["notify-send", "--app-name=screenRIG", "--urgency=" + spec.get("urgency", "normal"), "--print-id"]
+    if os.path.exists(ICON):
+        cmd.append("--icon=" + ICON)
+    for i, (label, _) in enumerate(spec.get("actions") or []):
+        cmd.append("--action=a%d=%s" % (i, label))
+    if spec.get("actions"):
+        cmd.append("--wait")
+    return cmd + ["--", spec["title"], spec.get("body", "")]
+
+
+def show_notice(spec):
+    """Raise the notification, remember its id under its tag, and run the action the person clicks."""
+    proc = subprocess.Popen(notice_command(spec), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    first = proc.stdout.readline().strip()
+    tag = spec.get("tag") or ""
+    if tag and first.isdigit():
+        os.makedirs(NOTICES, mode=0o700, exist_ok=True)
+        write_private(os.path.join(NOTICES, tag), first)
+    chosen = proc.stdout.readline().strip()
+    proc.wait()
+    if tag:
+        try:
+            with open(os.path.join(NOTICES, tag)) as f:
+                if f.read().strip() == first:
+                    os.remove(os.path.join(NOTICES, tag))
+        except OSError:
+            pass
+    actions = spec.get("actions") or []
+    m = re.fullmatch(r"a(\d)", chosen)
+    if m and int(m.group(1)) < len(actions):
+        subprocess.Popen(actions[int(m.group(1))][1], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+
+def close_notice(tag):
+    """Close the tagged notification if it is still up."""
+    try:
+        with open(os.path.join(NOTICES, tag)) as f:
+            nid = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                    "--object-path", "/org/freedesktop/Notifications",
+                    "--method", "org.freedesktop.Notifications.CloseNotification", str(nid)], capture_output=True)
+
+
+def capture():
+    """A region, chosen with Spectacle, cast from the panel."""
+    os.makedirs(os.path.join(CACHE, "captures"), exist_ok=True)
+    out = os.path.join(CACHE, "captures", time.strftime("capture-%Y%m%d-%H%M%S.png"))
+    try:
+        subprocess.run(["spectacle", "--background", "--region", "--nonotify", "--output", out],
+                       capture_output=True, timeout=600)
+    except FileNotFoundError:
+        raise Problem("Region captures use Spectacle: install it from Discover.")
+    if not os.path.exists(out) or os.path.getsize(out) == 0:
+        return "Capture cancelled"
+    summon_panel({"mode": "cast", "kind": "file", "source": "capture", "path": out})
+    return out
+
+
+def clipboard_types():
+    try:
+        return subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True, timeout=5).stdout.split()
+    except FileNotFoundError:
+        return None
+
+
+def clipboard_text():
+    if shutil.which("wl-paste"):
+        return subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True, timeout=5).stdout.strip()
+    # Klipper, Plasma's clipboard, holds text.
+    for qdbus in ("qdbus6", "qdbus-qt6", "qdbus"):
+        if shutil.which(qdbus):
+            out = subprocess.run([qdbus, "org.kde.klipper", "/klipper", "org.kde.klipper.klipper.getClipboardContents"],
+                                 capture_output=True, text=True, timeout=5)
+            if out.returncode == 0:
+                return out.stdout.strip()
+    return ""
+
+
+def clip():
+    types = clipboard_types() or []
+    for mime, ext in (("image/png", "png"), ("image/jpeg", "jpg"), ("image/webp", "webp")):
+        if mime in types:
+            os.makedirs(os.path.join(CACHE, "captures"), exist_ok=True)
+            out = os.path.join(CACHE, "captures", time.strftime("clipboard-%Y%m%d-%H%M%S.") + ext)
+            with open(out, "wb") as f:
+                f.write(subprocess.run(["wl-paste", "--type", mime], capture_output=True).stdout)
+            summon_panel({"mode": "cast", "kind": "file", "source": "clipboard", "path": out})
+            return out
+    text = clipboard_text()
+    if re.match(r"^https://\S+$", text):
+        summon_panel({"mode": "cast", "kind": "url", "source": "clipboard", "url": text})
+        return text
+    if text.startswith("file://"):
+        text = urllib.parse.unquote(urllib.parse.urlsplit(text).path)
+    if text.startswith("/") and os.path.isfile(text):
+        summon_panel({"mode": "cast", "kind": "file", "source": "clipboard", "path": text})
+        return text
+    if types is None:
+        raise Problem("The clipboard holds no https link. Images on the clipboard need wl-clipboard.")
+    raise Problem("Copy an https link or an image first.")
+
+
+def pick_file():
+    try:
+        proc = subprocess.run(["kdialog", "--title", "Cast to a screen", "--getopenfilename", HOME,
+                               "Images and video (*.png *.jpg *.jpeg *.webp *.gif *.mp4 *.webm)"],
+                              capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Problem("Picking a file uses kdialog: install it from Discover.")
+    path = proc.stdout.strip()
+    if proc.returncode != 0 or not path:
+        return "Cancelled"
+    summon_panel({"mode": "cast", "kind": "file", "source": "file", "path": path})
+    return path
+
+
+# --------------------------------------------------------------- live cast
+#
+# The desktop or one window, chosen in Plasma's own screen-share dialog (the
+# ScreenCast portal), encoded to H.264 by GStreamer and handed over a private
+# Unix socket to a local mediamtx that serves RTSP over TCP on the LAN. Android
+# and Qt Players on this network play it directly through a `stream` page;
+# screens elsewhere cannot reach this computer and are not offered.
+
+LIVE_DIR = os.path.join(STATE, "live")
+LIVE_BIN = os.path.join(DATA, "bin")
+MEDIAMTX_VERSION = "v1.21.3"
+# SHA-256 of mediamtx_v1.21.3_linux_amd64.tar.gz. Pinned here, so the download is checked against this
+# source and not against a file served beside it. A new version changes both lines.
+MEDIAMTX_SHA256 = "0a2ea7eba96023631efa1bea7804823a9145b043b6646a8a05798d4ac24ed635"
+LIVE_PORT = 8554
+LIVE_PLATFORMS = ("android", "qt")
+LIVE_NOTICE = "Live cast"
+# "Until I stop" casts hold a takeover lease the keep-alive renews; if the laptop
+# vanishes the lease runs out and the screens return to their own content.
+LIVE_LEASE_MIN = 75
+LIVE_RENEW_S = 3600
+PICK_WAIT_S = 120  # a cast waits this long for the person to choose in the screen-share dialog
+LIVE_SOURCES = ("screen", "window")
+CAPTURE_CANCELLED = 3
+ASSETS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "assets")
+FALLBACK_VERSION = 2
+
+
+def lan_ip():
+    out = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"], capture_output=True, text=True).stdout
+    m = re.search(r"\bsrc (\d+\.\d+\.\d+\.\d+)", out)
+    if not m:
+        raise Problem("This laptop has no network route.")
+    return m.group(1)
+
+
+PRIVATE_NETS = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+
+
+def lan_subnet(ip):
+    out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        m = re.search(r"inet (%s)/(\d+)" % re.escape(ip), line)
+        if m:
+            bits = int(m.group(2))
+            mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
+            n = int.from_bytes(socket.inet_aton(ip), "big") & mask
+            return "%s/%d" % (socket.inet_ntoa(n.to_bytes(4, "big")), bits)
+    return ip + "/32"
+
+
+def rule_subnet(subnet):
+    """The subnet a firewall rule may name. Its mask comes from the network (DHCP): a rule opens the stream
+    to a home or office network only, never to a range a network could stretch to everyone."""
+    net = ipaddress.ip_network(subnet)
+    if net.prefixlen < 16 or not any(net.subnet_of(private) for private in PRIVATE_NETS):
+        raise Problem("The firewall rule for live casting is only made for a private network of /16 or "
+                      "smaller; this one is %s. Allow TCP %d from your screens yourself." % (subnet, LIVE_PORT))
+    return subnet
+
+
+def public_ip():
+    with urllib.request.urlopen("https://1.1.1.1/cdn-cgi/trace", timeout=10) as resp:
+        for line in resp.read().decode().splitlines():
+            if line.startswith("ip="):
+                return line[3:].strip()
+    raise Problem("Could not learn this network's public address.")
+
+
+def screen_platform(s):
+    return ((s.get("host") or {}).get("platform") or (s.get("player") or {}).get("kind") or "").lower()
+
+
+def live_targets():
+    """Online Android and Qt screens behind the same public address as this laptop."""
+    cfg, _ = access_token()
+    here = public_ip()
+    out = []
+    for s in paged("/api/screens?project=" + project_id(cfg)):
+        if s.get("state") != "active":
+            continue
+        platform = screen_platform(s)
+        out.append({"id": s["id"], "label": s.get("label") or s["id"], "online": bool(s.get("online")),
+                     "platform": platform, "castable": platform in LIVE_PLATFORMS,
+                     "local": s.get("last_ip") == here})
+    usable = [t for t in out if t["castable"] and t["local"] and t["online"]]
+    usable.sort(key=lambda t: t["label"].lower())
+    return {"ok": True, "public_ip": here, "lan_ip": lan_ip(), "screens": usable,
+            "elsewhere": len([t for t in out if t["castable"] and t["online"] and not t["local"]]),
+            "last": read_json(LAST_CAST, {})}
+
+
+def mediamtx_binary():
+    path = os.path.join(LIVE_BIN, "mediamtx")
+    if os.access(path, os.X_OK):
+        return path
+    os.makedirs(LIVE_BIN, exist_ok=True)
+    base = "https://github.com/bluenviron/mediamtx/releases/download/%s/" % MEDIAMTX_VERSION
+    name = "mediamtx_%s_linux_amd64.tar.gz" % MEDIAMTX_VERSION
+    with urllib.request.urlopen(base + name, timeout=300) as resp:
+        blob = resp.read()
+    if hashlib.sha256(blob).hexdigest() != MEDIAMTX_SHA256:
+        raise Problem("The mediamtx download does not match the checksum this plugin expects.")
+    import io
+    import tarfile
+    with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+        member = tar.getmember("mediamtx")
+        if not member.isfile():
+            raise Problem("The mediamtx download is not the expected archive.")
+        with tar.extractfile(member) as src, open(path + ".tmp", "wb") as dst:
+            dst.write(src.read())
+    os.chmod(path + ".tmp", 0o755)
+    os.replace(path + ".tmp", path)
+    return path
+
+
+def write_private(path, text):
+    """Replace path with a file only this user can read."""
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
+
+def mediamtx_secret(value):
+    """mediamtx's `sha256:` form of a user name or password: base64 of its SHA-256, as a quoted scalar."""
+    return json.dumps("sha256:" + base64.b64encode(hashlib.sha256(value.encode()).digest()).decode())
+
+
+def mediamtx_config(user, password, socket_path):
+    """Reading `live` takes this cast's login. The picture comes only from the capture on this computer, over
+    a Unix socket in this user's private state folder, and nobody may publish: no other program here can put
+    its own picture on the screens. The login is stored hashed, so the file holds nothing to read back."""
+    os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(LIVE_DIR, "mediamtx.yml")
+    write_private(path, (
+        "logLevel: info\n"
+        "api: no\nmetrics: no\npprof: no\nplayback: no\n"
+        "rtsp: yes\nrtspAddress: :%d\nrtspTransports: [tcp]\nrtspEncryption: \"no\"\n"
+        "rtmp: no\n"
+        "hls: no\nwebrtc: no\nsrt: no\n"
+        "authMethod: internal\n"
+        "authInternalUsers:\n"
+        "  - user: %s\n    pass: %s\n    ips: []\n"
+        "    permissions:\n      - action: read\n        path: live\n"
+        "paths:\n  live:\n    source: %s\n"
+        % (LIVE_PORT, mediamtx_secret(user), mediamtx_secret(password), json.dumps("unix+mpegts://" + socket_path))))
+    return path
+
+
+def live_url(host, user, password):
+    return "rtsp://%s:%d/live" % (host, LIVE_PORT) if user is None else \
+        "rtsp://%s:%s@%s:%d/live" % (user, password, host, LIVE_PORT)
+
+
+# The firewall: firewalld (Fedora, openSUSE) or ufw (Kubuntu, KDE neon). The rule
+# made after Allow is recorded, so teardown removes exactly that rule, wherever
+# the computer has moved since.
+
+FIREWALL_RULE = os.path.join(STATE, "firewall.json")
+
+
+def unit_active(name):
+    return subprocess.run(["systemctl", "is-active", "--quiet", name]).returncode == 0
+
+
+def lan_interface(ip):
+    out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        m = re.match(r"\d+:\s+(\S+)\s+inet (%s)/" % re.escape(ip), line)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def firewalld_read(method, *args):
+    """A read from firewalld over D-Bus. Reads never ask for a password (no interactive authorization),
+    so opening the panel stays quiet; firewall-cmd, which may ask, runs only after Allow and in teardown."""
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    iface = "org.fedoraproject.FirewallD1" + ("" if method == "getDefaultZone" else ".zone")
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    params = GLib.Variant("(%s)" % ("s" * len(args)), args) if args else None
+    reply = bus.call_sync("org.fedoraproject.FirewallD1", "/org/fedoraproject/FirewallD1", iface, method, params,
+                          None, Gio.DBusCallFlags.NONE, 10000, None)
+    return reply.unpack()[0]
+
+
+def firewalld_zone(ip):
+    iface = lan_interface(ip)
+    zone = firewalld_read("getZoneOfInterface", iface) if iface else ""
+    return zone or firewalld_read("getDefaultZone")
+
+
+def firewalld_rich_rule(subnet):
+    return 'rule family="ipv4" source address="%s" port port="%d" protocol="tcp" accept' % (subnet, LIVE_PORT)
+
+
+def port_listed(ports, port=LIVE_PORT):
+    """Whether firewalld's `--list-ports` output opens TCP `port` (single ports and ranges)."""
+    for item in ports.split():
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?/tcp", item)
+        if m and int(m.group(1)) <= port <= int(m.group(2) or m.group(1)):
+            return True
+    return False
+
+
+def firewalld_opens(settings, subnet):
+    """Whether a zone's runtime settings (getZoneSettings2) let `subnet` reach TCP LIVE_PORT: an ACCEPT
+    target, an open port or range, or this widget's rich rule."""
+    if settings.get("target") == "ACCEPT":
+        return True
+    if port_listed(" ".join("%s/%s" % (port, proto) for port, proto in settings.get("ports") or [])):
+        return True
+    return firewalld_rich_rule(subnet) in (settings.get("rules_str") or [])
+
+
+def may_read_firewalld_zones():
+    """Whether polkit lets this process read firewalld's zones without a password. firewalld asks for one
+    on the spot when it does not, and opening the panel must never ask."""
+    return subprocess.run(["pkcheck", "--action-id", "org.fedoraproject.FirewallD1.config.info", "--process",
+                           str(os.getpid())], capture_output=True).returncode == 0
+
+
+def firewalld_state(subnet, zone):
+    """ok or needed. When the zone cannot be read quietly the rule is needed: Allow adds it, idempotently."""
+    if recorded_rule().get("kind") == "firewalld":
+        return "ok"
+    if not may_read_firewalld_zones():
+        return "needed"
+    return "ok" if firewalld_opens(firewalld_read("getZoneSettings2", zone), subnet) else "needed"
+
+
+def firewall_kind():
+    if unit_active("firewalld"):
+        return "firewalld"
+    if unit_active("ufw"):
+        return "ufw"
+    return ""
+
+
+def firewall_state(subnet, ip=None):
+    """ok, needed, inactive (no firewall) or no-sudo (ufw on, but sudo asks for a password)."""
+    kind = firewall_kind()
+    if kind == "firewalld":
+        return firewalld_state(subnet, firewalld_zone(ip or lan_ip()))
+    if kind != "ufw":
+        return "inactive"
+    status = subprocess.run(["sudo", "-n", "ufw", "status"], capture_output=True, text=True)
+    if status.returncode != 0:
+        return "no-sudo"
+    if re.search(r"^Status: inactive", status.stdout, re.M):
+        return "inactive"  # the unit is loaded, but ufw is switched off: nothing blocks the stream
+    if re.search(r"^%d/tcp\s+ALLOW\s+%s" % (LIVE_PORT, re.escape(subnet)), status.stdout, re.M):
+        return "ok"
+    return "needed"
+
+
+def live_setup_status():
+    subnet = lan_subnet(lan_ip())
+    return {"ok": True, "firewall": firewall_state(subnet), "firewall_kind": firewall_kind(), "subnet": subnet,
+            "port": LIVE_PORT}
+
+
+def recorded_rule():
+    try:
+        with open(FIREWALL_RULE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def live_unsetup():
+    """Undo live-setup: drop the firewall rule it recorded. firewalld asks for the password through Plasma's
+    own prompt; ufw only when sudo needs none."""
+    rule = recorded_rule()
+    if not rule:
+        return "Nothing to undo"
+    if rule.get("kind") == "firewalld":
+        for scope in (["--permanent"], []):
+            proc = subprocess.run(["firewall-cmd"] + scope + ["--zone=" + rule["zone"],
+                                  "--remove-rich-rule=" + firewalld_rich_rule(rule["subnet"])], capture_output=True, text=True)
+            if proc.returncode != 0 and "NOT_ENABLED" not in proc.stderr + proc.stdout:
+                raise Problem("The firewall rule was not removed: %s" % (proc.stderr or proc.stdout).strip())
+    elif rule.get("kind") == "ufw":
+        proc = subprocess.run(["sudo", "-n", "ufw", "delete", "allow", "from", rule["subnet"], "to", "any", "port",
+                               str(LIVE_PORT), "proto", "tcp"], capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise Problem("Run once: sudo ufw delete allow from %s to any port %d proto tcp" % (rule["subnet"], LIVE_PORT))
+    os.remove(FIREWALL_RULE)
+    return "%s rule for TCP %d from %s removed" % (rule.get("kind"), LIVE_PORT, rule.get("subnet"))
+
+
+def live_setup():
+    """The change live casting needs, made only after the person allows it in the panel."""
+    ip = lan_ip()
+    subnet = lan_subnet(ip)
+    kind = firewall_kind()
+    state = firewall_state(subnet, ip)
+    if state == "no-sudo":
+        raise Problem("Run once: sudo ufw allow from %s to any port %d proto tcp comment 'screenRIG live cast'"
+                      % (rule_subnet(subnet), LIVE_PORT))
+    if state != "needed":
+        return "Live casting is set up"
+    subnet = rule_subnet(subnet)
+    if kind == "firewalld":
+        zone = firewalld_zone(ip)
+        for scope in (["--permanent"], []):
+            proc = subprocess.run(["firewall-cmd"] + scope + ["--zone=" + zone,
+                                  "--add-rich-rule=" + firewalld_rich_rule(subnet)], capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise Problem("The firewall refused the rule: %s" % (proc.stderr or proc.stdout or "not authorized").strip())
+            write_private(FIREWALL_RULE, json.dumps({"kind": kind, "zone": zone, "subnet": subnet}))
+        return "Live casting is set up: firewalld zone %s allows TCP %d from %s" % (zone, LIVE_PORT, subnet)
+    subprocess.run(["sudo", "-n", "ufw", "allow", "from", subnet, "to", "any", "port", str(LIVE_PORT),
+                    "proto", "tcp", "comment", "screenRIG live cast"], capture_output=True, check=True)
+    write_private(FIREWALL_RULE, json.dumps({"kind": kind, "subnet": subnet}))
+    return "Live casting is set up: ufw allows TCP %d from %s" % (LIVE_PORT, subnet)
+
+
+def solid_png(width=1280, height=720, rgb=(11, 12, 14)):
+    import struct
+    import zlib
+    row = b"\x00" + bytes(rgb) * width
+    raw = zlib.compress(row * height, 9)
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", raw) + chunk(b"IEND", b""))
+
+
+def live_project_state():
+    cfg = load_config()
+    path = os.path.join(LIVE_DIR, "project-%s.json" % project_id(cfg))
+    try:
+        with open(path) as f:
+            return path, json.load(f)
+    except (OSError, ValueError):
+        return path, {}
+
+
+def save_live(state):
+    write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
+
+
+def live_playlist(url, state):
+    """A playlist that plays this cast's stream. Its address carries the cast's login, so every cast
+    makes its own (live_stop deletes it) and the address is never kept in the project state.
+
+    The name is written to `state` before the request, as `playlist_pending`, and stays there while the
+    outcome is unknown: a reply lost after the playlist was made leaves no id, and live_stop finds the
+    playlist by that name."""
+    cfg, _ = access_token()
+    pid = project_id(cfg)
+    path, project = live_project_state()
+    fallback = project.get("fallback_media_id") if project.get("fallback_version") == FALLBACK_VERSION else None
+    if not fallback:
+        png = os.path.join(ASSETS, "live-fallback.png")
+        if not os.path.exists(png):
+            png = os.path.join(LIVE_DIR, "fallback.png")
+            with open(png, "wb") as f:
+                f.write(solid_png())
+        fallback, _ = upload_media(png)
+        with open(path, "w") as f:
+            json.dump({"fallback_media_id": fallback, "fallback_version": FALLBACK_VERSION}, f)
+    page = {
+        "id": "live",
+        "canvas": {"width": 1920, "height": 1080, "background": "#000000FF"},
+        "transition": {"type": "crossfade", "duration_ms": 300},
+        "advance": {"mode": "duration", "after_ms": 30000},
+        "primitives": [{"id": "stream", "primitive": "stream", "sources": [{"protocol": "rtsp", "url": url}],
+                        "fallback_media_id": fallback, "muted": True,
+                        "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080}, "layer": 0, "content_fit": "contain"}],
+    }
+    name = "Live cast from %s (%s)" % (socket.gethostname(), secrets.token_hex(3))
+    state["playlist_pending"] = name
+    save_live(state)
+    try:
+        playlist = api("POST", "/api/projects/%s/playlists" % pid, {"name": name, "pages": [page]}, idempotent=True)
+    except Problem as err:
+        if not isinstance(err, Uncertain):
+            del state["playlist_pending"]  # refused: there is no playlist to look for
+        raise
+    del state["playlist_pending"]
+    if "id" not in playlist:
+        raise Problem("The live playlist waits for a person's review before it can play.")
+    return playlist["id"]
+
+
+LAST_CAST = os.path.join(STATE, "last-cast.json")
+
+
+def remember_cast(**fields):
+    """What was cast last and where, so the Cast tab can preselect it."""
+    try:
+        with open(LAST_CAST) as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        last = {}
+    last.update({k: v for k, v in fields.items() if v})
+    os.makedirs(STATE, exist_ok=True)
+    with open(LAST_CAST + ".tmp", "w") as f:
+        json.dump(last, f)
+    os.replace(LAST_CAST + ".tmp", LAST_CAST)
+
+
+CAST_REASON = "Live cast from KDE Plasma"
+
+
+def read_screen(sid):
+    """The screen, or None when it no longer exists."""
+    try:
+        return api("GET", "/api/screens/" + sid, retry=True)
+    except Problem as err:
+        if err.status == 404:
+            return None
+        raise
+
+
+def takeover_is(screen, playlist):
+    """Whether the screen's takeover is this cast's playlist. A takeover someone else placed is never ours."""
+    return bool(playlist) and (screen.get("takeover") or {}).get("playlist_id") == playlist
+
+
+def guarded(screen):
+    """If-Match for the revision just read, so a change made since is refused (412) instead of overwritten."""
+    return {"If-Match": '"%s"' % screen["revision"]} if screen.get("revision") is not None else {}
+
+
+def change_takeover(sid, playlist, method, body=None):
+    """Post or clear a screen's takeover only while it is this cast's. The write is guarded by the revision
+    just read; when the screen changed meanwhile the check is made again. Returns whether the screen's
+    takeover was this cast's and the write was sent."""
+    for _ in range(3):
+        screen = read_screen(sid)
+        if screen is None or not takeover_is(screen, playlist):
+            return False
+        try:
+            api(method, "/api/screens/%s/takeover" % sid, body, idempotent=True, headers=guarded(screen))
+            return True
+        except Problem as err:
+            if err.status != 412:
+                raise
+    raise Problem("The screen kept changing, so its takeover was left alone.")
+
+
+def settle_unsure(state):
+    """Decide the screens whose takeover outcome is unknown: one is the cast's exactly when it shows the
+    cast's playlist as its takeover. A screen that cannot be read now stays in the ledger for live_stop."""
+    for sid in list(state.get("unsure") or []):
+        try:
+            screen = read_screen(sid)
+        except Problem as err:
+            warn("cannot tell whether %s took the cast: %s" % (sid, why(err)))
+            continue
+        state["unsure"].remove(sid)
+        if screen is not None and takeover_is(screen, state.get("playlist_id")):
+            state["screens"].append(sid)
+
+
+def live_status():
+    try:
+        with open(os.path.join(LIVE_DIR, "live.json")) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return {"ok": True, "live": False}
+    alive = all(pid_alive(state.get(k)) for k in ("recorder_pid", "server_pid"))
+    # The stream address carries the cast's login; nothing that reads the status needs it.
+    return dict({k: v for k, v in state.items() if k != "url"}, ok=True, live=alive)
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def stream_ready(url):
+    """Whether the RTSP server describes the stream, which it does once the recorder publishes. The login
+    travels in a header: on a command line every user of this machine could read it."""
+    parts = urllib.parse.urlsplit(url)
+    login = base64.b64encode(("%s:%s" % (parts.username, parts.password)).encode()).decode()
+    target = "rtsp://%s:%d%s" % (parts.hostname, parts.port, parts.path)
+    ask = "DESCRIBE %s RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\nAuthorization: Basic %s\r\n\r\n" % (target, login)
+    try:
+        with socket.create_connection((parts.hostname, parts.port), timeout=5) as conn:
+            conn.sendall(ask.encode())
+            return conn.recv(64).startswith(b"RTSP/1.0 200")
+    except OSError:
+        return False
+
+
+def wait_for_stream(url, seconds=20, recorder=None):
+    """Whether the stream came up in time. Gives up at once when the recorder has exited."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if recorder is not None and recorder.poll() is not None:
+            return False
+        if stream_ready(url):
+            return True
+        time.sleep(1)
+    return False
+
+
+def live_start(source, screens, minutes, label):
+    if live_status().get("live"):
+        live_stop()
+    if not screens:
+        raise Problem("Pick at least one screen on this network.")
+    ip = lan_ip()
+    if firewall_state(lan_subnet(ip)) in ("needed", "no-sudo"):
+        raise Problem("Allow live casting in the Cast tab first: screens need to reach this laptop.")
+    os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
+    logs = os.path.join(CACHE, "live")
+    os.makedirs(logs, exist_ok=True)
+    user, password = secrets.token_hex(8), secrets.token_hex(16)
+    sock = os.path.join(LIVE_DIR, "ts.sock")
+    if os.path.exists(sock):
+        os.remove(sock)
+    if source not in LIVE_SOURCES:
+        raise Problem("Unknown live source %s" % source)
+    server = subprocess.Popen([mediamtx_binary(), mediamtx_config(user, password, sock)],
+                              stdout=open(os.path.join(logs, "mediamtx.log"), "w"),
+                              stderr=subprocess.STDOUT, start_new_session=True)
+    # `screens` holds the screens whose takeover this cast placed. `unsure` holds those asked to take it whose
+    # answer was lost; live_stop ends a takeover there only if it is still this cast's playlist.
+    state = {"server_pid": server.pid, "source": source, "label": label, "screens": [], "unsure": [],
+             "started_at": time.time(), "url": live_url(ip, user, password)}
+    started = False
+    try:
+        # Plasma's own screen-share dialog asks which screen or window, as it does for any other app.
+        recorder = subprocess.Popen(SELF + ["live-capture", source, sock],
+                                    stdout=open(os.path.join(logs, "recorder.log"), "w"), stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        state["recorder_pid"] = recorder.pid
+        write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
+        if not wait_for_stream(live_url("127.0.0.1", user, password), PICK_WAIT_S, recorder):
+            if recorder.poll() == CAPTURE_CANCELLED:
+                raise Problem("Nothing was chosen in the screen-share dialog, so nothing was cast.")
+            raise Problem("The capture did not start; see %s" % os.path.join(logs, "recorder.log"))
+        playlist = state["playlist_id"] = live_playlist(state["url"], state)
+        until = iso_in(minutes) if minutes > 0 else iso_in(LIVE_LEASE_MIN)
+        shown, failed = state["screens"], []
+        for sid in screens:
+            # Recorded before the request: a takeover whose answer is lost is still ended when the cast stops.
+            state["unsure"].append(sid)
+            save_live(state)
+            try:
+                api("POST", "/api/screens/%s/takeover" % sid,
+                    {"playlist_id": playlist, "until": until, "reason": CAST_REASON}, idempotent=True)
+            except Uncertain as err:
+                failed.append(str(err))  # may have been placed; settled below
+                continue
+            except Problem as err:
+                state["unsure"].remove(sid)
+                failed.append(str(err))
+                continue
+            state["unsure"].remove(sid)
+            shown.append(sid)
+        settle_unsure(state)
+        if not shown:
+            raise Problem("No screen took the cast: %s" % "; ".join(failed))
+        # `until` is the cast's own end (none until stopped); the lease is the takeover's.
+        state.update(until=until if minutes > 0 else None, lease=minutes <= 0, renewed_at=time.time())
+        keepalive = [sys.executable, os.path.realpath(__file__), "live-keepalive"]
+        if shutil.which("systemd-inhibit"):
+            keepalive = ["systemd-inhibit", "--what=sleep:shutdown", "--mode=delay", "--who=screenRIG",
+                         "--why=Stop the live cast before sleeping"] + keepalive
+        state["keepalive_pid"] = subprocess.Popen(keepalive, stdout=open(os.path.join(logs, "keepalive.log"), "w"),
+                                                  stderr=subprocess.STDOUT, start_new_session=True).pid
+        write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
+        remember_cast(source=source, label=label, screens=shown, minutes=str(minutes))
+        # Stays up until the cast ends, so Stop is always one click away.
+        ends = time.strftime(" · until %-I:%M %p", time.localtime(time.time() + minutes * 60)) if minutes > 0 else ""
+        notify(LIVE_NOTICE, "%s on %d screen%s%s" % (label, len(shown), "" if len(shown) == 1 else "s", ends), "critical",
+               [("Stop", SELF + ["live-stop", "--notify"]),
+                ("Open", SELF + ["summon", json.dumps({"mode": "cast"})])], tag="live")
+        started = True
+        return "Live: %s on %d screen%s" % (label, len(shown), "" if len(shown) == 1 else "s")
+    finally:
+        if not started:
+            # Whatever failed after the capture began, end it the way Stop does.
+            write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
+            live_stop()
+
+
+# ------------------------------------------------------------------ capture
+#
+# `live-capture SOURCE SOCKET` runs for the length of a cast. It holds the
+# ScreenCast portal session (the dialog, and Plasma's "sharing" indicator, whose
+# Stop ends the cast) and feeds GStreamer's H.264 into mediamtx's socket.
+
+PORTAL = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+# Hardware first; each is tried once on this computer and the first that encodes is kept.
+ENCODERS = [
+    "vah264lpenc rate-control=cbr bitrate=6000 key-int-max=30 target-usage=7",
+    "vah264enc rate-control=cbr bitrate=6000 key-int-max=30 target-usage=7",
+    "nvh264enc bitrate=6000 gop-size=30 zerolatency=true",
+    "x264enc tune=zerolatency speed-preset=veryfast bitrate=6000 key-int-max=30",
+    "openh264enc bitrate=6000000 rate-control=bitrate gop-size=30 complexity=low usage-type=screen",
+]
+
+
+def h264_encoder():
+    """The first encoder in ENCODERS that this computer's GStreamer can run, remembered in the cache."""
+    memo = os.path.join(CACHE, "encoder")
+    try:
+        with open(memo) as f:
+            saved = f.read().strip()
+        if saved in ENCODERS:
+            return saved
+    except OSError:
+        pass
+    if not shutil.which("gst-launch-1.0"):
+        raise Problem("Live casting uses GStreamer: install gstreamer1 and its PipeWire plugin.")
+    for enc in ENCODERS:
+        probe = ["gst-launch-1.0", "-q", "videotestsrc", "num-buffers=5", "!", "video/x-raw,width=640,height=360",
+                 "!", "videoconvert", "!"] + enc.split() + ["!", "fakesink"]
+        try:
+            if subprocess.run(probe, capture_output=True, timeout=20).returncode == 0:
+                os.makedirs(CACHE, exist_ok=True)
+                with open(memo, "w") as f:
+                    f.write(enc)
+                return enc
+        except subprocess.TimeoutExpired:
+            continue
+    raise Problem("GStreamer has no H.264 encoder here: install gstreamer1-plugin-openh264 or a VA-API driver.")
+
+
+def capture_pipeline(pw_fd, node, out_fd, encoder):
+    """gst-launch arguments: the portal's PipeWire stream, 1920x1080 at 30 fps (letterboxed), H.264 in MPEG-TS."""
+    return (["gst-launch-1.0", "-e", "-q",
+             "pipewiresrc", "fd=%d" % pw_fd, "path=%d" % node, "do-timestamp=true", "keepalive-time=1000",
+             "always-copy=true", "!", "videoconvert", "!", "videoscale", "add-borders=true", "!", "videorate", "!",
+             "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1,framerate=30/1", "!",
+             "queue", "max-size-buffers=2", "leaky=downstream", "!"] + encoder.split() +
+            ["!", "h264parse", "config-interval=-1", "!", "mpegtsmux", "!", "fdsink", "fd=%d" % out_fd, "sync=false"])
+
+
+def live_capture(source, sock_path):
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+
+    encoder = h264_encoder()
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    loop = GLib.MainLoop()
+    iface = "org.freedesktop.portal.ScreenCast"
+
+    def request(method, signature, args, timeout_s=PICK_WAIT_S):
+        token = "screenrig_" + secrets.token_hex(6)
+        path = "/org/freedesktop/portal/desktop/request/%s/%s" % (sender, token)
+        answer = {}
+
+        def on_response(_conn, _sender, _path, _iface, _signal, params):
+            answer["code"], answer["results"] = params.unpack()
+            loop.quit()
+
+        sub = bus.signal_subscribe(PORTAL[0], "org.freedesktop.portal.Request", "Response", path, None,
+                                   Gio.DBusSignalFlags.NO_MATCH_RULE, on_response)
+        args[-1]["handle_token"] = GLib.Variant("s", token)
+        bus.call_sync(PORTAL[0], PORTAL[1], iface, method, GLib.Variant(signature, tuple(args)), None,
+                      Gio.DBusCallFlags.NONE, -1, None)
+        timer = GLib.timeout_add_seconds(timeout_s, loop.quit)
+        loop.run()
+        GLib.source_remove(timer) if answer else None
+        bus.signal_unsubscribe(sub)
+        if not answer:
+            raise Problem("The screen-share dialog did not answer.")
+        return answer["code"], answer["results"]
+
+    def portal_property(name):
+        try:
+            value = bus.call_sync(PORTAL[0], PORTAL[1], "org.freedesktop.DBus.Properties", "Get",
+                                  GLib.Variant("(ss)", (iface, name)), None, Gio.DBusCallFlags.NONE, -1, None)
+            return value.unpack()[0]
+        except GLib.Error:
+            return 0
+
+    code, res = request("CreateSession", "(a{sv})",
+                        [{"session_handle_token": GLib.Variant("s", "screenrig_" + secrets.token_hex(6))}])
+    if code != 0:
+        raise Problem("The ScreenCast portal refused a session.")
+    session = res["session_handle"]
+    options = {"types": GLib.Variant("u", 1 if source == "screen" else 2), "multiple": GLib.Variant("b", False)}
+    if portal_property("AvailableCursorModes") & 2:
+        options["cursor_mode"] = GLib.Variant("u", 2)  # the pointer is drawn into the picture
+    code, _ = request("SelectSources", "(oa{sv})", [session, options])
+    if code == 0:
+        code, res = request("Start", "(osa{sv})", [session, "", {}])
+    if code != 0:
+        warn("nothing was chosen in the screen-share dialog")
+        return CAPTURE_CANCELLED
+    node = res["streams"][0][0]
+    reply, fds = bus.call_with_unix_fd_list_sync(PORTAL[0], PORTAL[1], iface, "OpenPipeWireRemote",
+                                                 GLib.Variant("(oa{sv})", (session, {})), GLib.VariantType("(h)"),
+                                                 Gio.DBusCallFlags.NONE, -1, None, None)
+    pw_fd = fds.get(reply.unpack()[0])
+    out = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    deadline = time.time() + 10
+    while True:
+        try:
+            out.connect(sock_path)
+            break
+        except OSError:
+            if time.time() > deadline:
+                raise Problem("The stream server did not open its socket.")
+            time.sleep(0.2)
+    gst = subprocess.Popen(capture_pipeline(pw_fd, node, out.fileno(), encoder), pass_fds=(pw_fd, out.fileno()))
+    os.close(pw_fd)
+    out.close()
+    result = {"code": 0}
+
+    def stop(*_):
+        if gst.poll() is None:
+            gst.send_signal(signal.SIGINT)
+            GLib.timeout_add_seconds(3, lambda: gst.poll() is None and gst.kill())
+        return True
+
+    def gst_exited(_pid, status):
+        result["code"] = 0 if os.waitstatus_to_exitcode(status) in (0, -signal.SIGINT) else 1
+        loop.quit()
+
+    # Stop in Plasma's sharing indicator closes the session.
+    bus.signal_subscribe(PORTAL[0], "org.freedesktop.portal.Session", "Closed", session, None,
+                         Gio.DBusSignalFlags.NO_MATCH_RULE, lambda *a: stop())
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, stop)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, stop)
+    GLib.child_watch_add(GLib.PRIORITY_DEFAULT, gst.pid, gst_exited)
+    loop.run()
+    try:
+        bus.call_sync(PORTAL[0], session, "org.freedesktop.portal.Session", "Close", None, None,
+                      Gio.DBusCallFlags.NONE, -1, None)
+    except GLib.Error:
+        pass  # already closed
+    return result["code"]
+
+
+def live_keepalive():
+    """While a cast is live: renew its lease, end it if the capture dies, and stop it before sleep."""
+    path = os.path.join(LIVE_DIR, "live.json")
+    stop_now = threading.Event()
+    monitors = []
+
+    def watch_sleep():
+        try:
+            mon = subprocess.Popen(["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1",
+                                    "--object-path", "/org/freedesktop/login1"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except FileNotFoundError:
+            return
+        monitors.append(mon)
+        for line in mon.stdout:
+            if re.search(r"PrepareFor(Sleep|Shutdown) \(true,\)", line):
+                stop_now.set()
+                return
+
+    threading.Thread(target=watch_sleep, daemon=True).start()
+    try:
+        return keep_alive_loop(path, stop_now)
+    finally:
+        for mon in monitors:
+            mon.terminate()
+
+
+def keep_alive_loop(path, stop_now):
+    while True:
+        if stop_now.wait(timeout=10):
+            live_stop()
+            return 0
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            return 0
+        if not (pid_alive(state.get("recorder_pid")) and pid_alive(state.get("server_pid"))):
+            live_stop()
+            notify("Live cast stopped", "The capture ended, so the screens went back to their own content.", "normal")
+            return 0
+        if state.get("lease") and time.time() - state.get("renewed_at", 0) >= LIVE_RENEW_S:
+            until = iso_in(LIVE_LEASE_MIN)
+            body = {"playlist_id": state["playlist_id"], "until": until, "reason": CAST_REASON}
+            for sid in list(state.get("screens") or []):
+                try:
+                    # Only a takeover that is still this cast's is extended; one someone placed since is theirs.
+                    if not change_takeover(sid, state["playlist_id"], "POST", body):
+                        state["screens"].remove(sid)
+                        warn("%s no longer shows the live cast, so it is not renewed" % sid)
+                except Problem as err:
+                    warn("lease renewal for %s failed: %s" % (sid, why(err)))
+            state["renewed_at"] = time.time()
+            write_private(path, json.dumps(state))
+            if not state["screens"]:
+                live_stop()
+                notify("Live cast stopped", "The screens now show other content, so the cast ended.", "normal")
+                return 0
+
+
+def live_stop():
+    path = os.path.join(LIVE_DIR, "live.json")
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return "Nothing is live"
+    # The capture, the RTSP server (whose login the playlist carries) and the keep-alive end first, whatever
+    # the API then does, and the state goes with them so a new cast cannot be mistaken for this one.
+    try:
+        for key, sig in (("keepalive_pid", signal.SIGTERM), ("recorder_pid", signal.SIGINT), ("server_pid", signal.SIGTERM)):
+            try:
+                if int(state.get(key) or 0) == os.getpgrp() or not pid_alive(state.get(key)):
+                    continue
+                os.killpg(int(state[key]), sig)
+            except (OSError, ValueError) as err:
+                warn("could not end %s: %s" % (key, why(err)))
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        close_notice("live")
+    playlist = state.get("playlist_id")
+    # A takeover is ended only while it is still this cast's playlist, including those whose answer was lost.
+    for sid in dict.fromkeys((state.get("screens") or []) + (state.get("unsure") or [])) if playlist else ():
+        try:
+            change_takeover(sid, playlist, "DELETE")
+        except Exception as err:
+            warn("could not end the takeover on %s: %s" % (sid, why(err)))
+    if not playlist and state.get("playlist_pending"):
+        playlist = find_playlist(state["playlist_pending"])
+    if playlist:
+        # The playlist's stream address carries the cast's login; the takeovers are gone, so it can go too.
+        try:
+            api("DELETE", "/api/playlists/%s" % playlist, idempotent=True)
+        except Problem as err:
+            if err.status != 404:
+                warn("could not delete the live playlist %s: %s" % (playlist, why(err)))
+        except Exception as err:
+            warn("could not delete the live playlist %s: %s" % (playlist, why(err)))
+    return "Live cast stopped"
+
+
+def find_playlist(name):
+    """The id of the playlist a lost create answer made (the name is unique to the cast), if it exists."""
+    try:
+        for item in paged("/api/playlists?project=" + project_id(load_config())):
+            if item.get("name") == name and item.get("id"):
+                return item["id"]
+    except Exception as err:
+        warn("could not look for the live playlist %r: %s" % (name, why(err)))
+    return None
+
+
+# --------------------------------------------------------------------- setup
+#
+# The widget runs `setup` when it loads. Idempotent: it changes only what
+# differs, and says what it changed. `teardown` removes all of it.
+
+SEND_ENTRY = os.path.join(APPS, "screenrig-kde-send.desktop")
+
+
+def desktop_quote(arg):
+    """An Exec argument, quoted as the Desktop Entry spec asks."""
+    return '"%s"' % re.sub(r'([`$\\"])', r"\\\1", arg).replace("%", "%%")
+
+
+def send_entry():
+    """'Open with > Cast to a screenRIG screen' for images and video, in Dolphin and every file manager."""
+    return ("[Desktop Entry]\nType=Application\nName=Cast to a screenRIG screen\n"
+            "Exec=%s send-file %%f\nIcon=%s\n"
+            "MimeType=image/png;image/jpeg;image/webp;image/gif;video/mp4;video/webm;\nNoDisplay=true\n"
+            % (" ".join(desktop_quote(a) for a in SELF), ICON if os.path.exists(ICON) else "video-display"))
+
+
+def place_text(dest, text, mode=0o644):
+    try:
+        with open(dest) as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest + ".tmp", "w") as f:
+        f.write(text)
+    os.chmod(dest + ".tmp", mode)
+    os.replace(dest + ".tmp", dest)
+    return True
+
+
+def setup():
+    changed = []
+    if place_text(SEND_ENTRY, send_entry()):
+        subprocess.run(["update-desktop-database", APPS], capture_output=True)
+        changed.append("Open With entry")
+    return "Set up: " + ", ".join(changed) if changed else "Already set up"
+
+
+def teardown():
+    """Undo everything the widget set up, before the widget is removed."""
+    done = []
+    if live_status().get("live"):
+        live_stop()
+        done.append("live cast stopped")
+    undone = live_unsetup()
+    if undone != "Nothing to undo":
+        done.append(undone)
+    if os.path.exists(SEND_ENTRY):
+        os.remove(SEND_ENTRY)
+        subprocess.run(["update-desktop-database", APPS], capture_output=True)
+        done.append(os.path.basename(SEND_ENTRY) + " removed")
+    if stop_server():
+        done.append("background follower stopped")
+    # Screenshots, captures, logs, the cast history and the downloaded mediamtx.
+    for folder in (STATE, CACHE, DATA):
+        if os.path.isdir(folder):
+            shutil.rmtree(folder, ignore_errors=True)
+            done.append(folder.replace(HOME, "~") + " removed")
+    return "; ".join(done) or "Nothing to undo"
+
+
+# ---------------------------------------------------------------------- feed
+#
+# Plasma widgets run commands and read their output when they exit, so `serve`
+# (a background Follower) writes what the widget needs to FEED and `wait`
+# returns it as soon as it changes. `serve` ends a while after the last `wait`,
+# so it never outlives the widget for long.
+
+FEED = os.path.join(STATE, "feed.json")
+SERVE_LOCK = os.path.join(STATE, "serve.lock")
+SERVE_PID = os.path.join(STATE, "serve.pid")
+HEARTBEAT = os.path.join(STATE, "heartbeat")
+WAIT_S = 25
+IDLE_S = 150
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+class Feed:
+    """Keeps the latest snapshot and connection status in FEED; every change gets a higher seq."""
+
+    def __init__(self):
+        self.state = {"seq": int(read_json(FEED, {}).get("seq") or 0) + 1, "snapshot": None,
+                      "status": {"ok": False, "error": ""}}
+        self.lock = threading.Lock()
+        self.write()
+
+    def write(self):
+        write_private(FEED, json.dumps(self.state))
+
+    def __call__(self, obj):
+        with self.lock:
+            kind = obj.get("kind")
+            if kind == "snapshot":
+                self.state["snapshot"] = obj
+            elif kind in ("status", "event"):
+                status = {"ok": bool(obj.get("ok", True)), "error": obj.get("error", "")}
+                if status == self.state["status"]:
+                    return
+                self.state["status"] = status
+            else:
+                return
+            self.state["seq"] += 1
+            self.write()
+
+
+def server_running():
+    """Whether a `serve` holds the lock."""
+    try:
+        fd = os.open(SERVE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def ensure_server():
+    if not server_running():
+        logs = os.path.join(CACHE, "serve.log")
+        subprocess.Popen(SELF + ["serve", "--notify"], stdin=subprocess.DEVNULL, stdout=open(logs, "a"),
+                         stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def stop_server():
+    pid = read_json(SERVE_PID, 0)
+    if server_running() and pid_alive(pid):
+        os.kill(int(pid), signal.SIGTERM)
+        return True
+    return False
+
+
+def serve(do_notify):
+    fd = os.open(SERVE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0  # another one is running
+    write_private(SERVE_PID, str(os.getpid()))
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+
+    def idle_watch():
+        while True:
+            time.sleep(30)
+            try:
+                if time.time() - os.path.getmtime(HEARTBEAT) > IDLE_S:
+                    os._exit(0)
+            except OSError:
+                os._exit(0)
+
+    with open(HEARTBEAT, "w"):
+        pass
+    threading.Thread(target=idle_watch, daemon=True).start()
+    Follower(do_notify=do_notify, out=Feed()).run()
+    return 0
+
+
+def wait_feed(since, summon_since, seconds=WAIT_S):
+    """The feed once its seq differs from `since`, or a summon newer than `summon_since`; else, after
+    `seconds`, the feed as it is."""
+    with open(HEARTBEAT, "w"):
+        pass
+    ensure_server()
+    deadline = time.time() + seconds
+    while True:
+        feed = read_json(FEED, {"seq": 0})
+        summon = read_json(SUMMON, {})
+        fresh = summon if float(summon.get("at") or 0) > summon_since else None
+        if feed.get("seq") != since or fresh or time.time() >= deadline:
+            return {"ok": True, "feed": feed, "summon": fresh, "live": live_status()}
+        time.sleep(0.25)
+
+
+# -------------------------------------------------------------------- follow
+
+class Follower:
+    """Streams project events, keeps a fresh snapshot and raises desktop notifications."""
+
+    def __init__(self, do_notify, out=None):
+        self.do_notify = do_notify
+        self.out = out or emit
+        self.dirty = threading.Event()
+        self.snap = None
+        self.offline_notified = set()
+        self.publish = {}
+        self.publish_lock = threading.Lock()
+        self.credits_low = None
+        self.seen_reviews = None
+
+    def refresh(self):
+        try:
+            self.snap = snapshot()
+            self.out(self.snap)
+            low = self.snap["credits"].get("low")
+            if low and self.credits_low is False and self.do_notify:
+                notify("screenRIG credits are low", "%s credits left this month." % self.snap["credits"].get("remaining"),
+                       "critical", [("Billing", ["xdg-open", DASHBOARD + "/billing/settings"])])
+            if low is not None:
+                self.credits_low = low
+            fetch_all_shots(self.snap["screens"])
+            self.out(dict(self.snap, screens=[dict(s, shot=shot_path(s["id"]) if os.path.exists(shot_path(s["id"])) else "",
+                                               shot_mtime=int(os.path.getmtime(shot_path(s["id"])))
+                                               if os.path.exists(shot_path(s["id"])) else 0)
+                                          for s in self.snap["screens"]]))
+        except Problem as err:
+            self.out({"kind": "status", "ok": False, "error": str(err)})
+
+    def snapshot_loop(self):
+        last = 0.0
+        while True:
+            fired = self.dirty.wait(timeout=300)
+            if fired:
+                time.sleep(1.5)
+                self.dirty.clear()
+            if fired or time.time() - last >= 300:
+                self.refresh()
+                last = time.time()
+
+    def reviews_loop(self):
+        while True:
+            try:
+                cfg, _ = access_token()
+                items = api("GET", "/api/advertising/reviews?project=" + project_id(cfg)).get("items") or []
+                pending = {r["id"] for r in items if r.get("state") == "pending"}
+                if self.seen_reviews is not None and self.do_notify:
+                    for _ in pending - self.seen_reviews:
+                        notify("An ad booking needs your review", "A buyer submitted creative for your screens.",
+                               "normal", [("Review", ["xdg-open", DASHBOARD + "/advertising/seller-campaigns"])])
+                self.seen_reviews = pending
+            except (Problem, KeyError):
+                pass
+            time.sleep(600)
+
+    def screen_name(self, sid, fallback):
+        for s in (self.snap or {}).get("screens", []):
+            if s["id"] == sid:
+                return s["label"]
+        return fallback or sid
+
+    def flush_publish(self, playlist):
+        with self.publish_lock:
+            screens = self.publish.pop(playlist, set())
+        if screens and self.do_notify:
+            name = next((p["name"] for p in (self.snap or {}).get("playlists", []) if p["id"] == playlist), "A playlist")
+            notify("Published: %s" % name, "Now showing on %d screen%s." % (len(screens), "" if len(screens) == 1 else "s"),
+                   "low", [("Open", ["xdg-open", "%s/playlists/%s" % (DASHBOARD, playlist)])])
+
+    def on_event(self, ev):
+        etype = ev.get("type", "")
+        if etype.startswith("screen.") or etype.startswith("playlist.") or etype.startswith("operation."):
+            self.dirty.set()
+        self.out({"kind": "event", "type": etype, "resource": ev.get("resource"), "message": ev.get("message"),
+              "at": ev.get("at")})
+        if not self.do_notify:
+            return
+        res = ev.get("resource") or {}
+        sid = res.get("id", "")
+        name = self.screen_name(sid, res.get("name"))
+        details = ev.get("details") or {}
+        if etype == "screen.offline":
+            self.offline_notified.add(sid)
+            payload = json.dumps({"mode": "screens", "focus": sid})
+            notify("%s went offline" % name, "Last online %s." % (details.get("last_online_at") or "")[11:16],
+                   "critical", [("Open", SELF + ["summon", payload]),
+                                ("Reload", SELF + ["act", sid, "reload", "--notify"]),
+                                ("Dashboard", ["xdg-open", "%s/screens/%s" % (DASHBOARD, sid)])])
+        elif etype == "screen.online" and sid in self.offline_notified:
+            self.offline_notified.discard(sid)
+            notify("%s is back online" % name, "", "low")
+        elif etype == "screen.manifest_upgrade" and details.get("state") == "current":
+            playlist = next((s.get("playing_id") for s in (self.snap or {}).get("screens", []) if s["id"] == sid), None)
+            if playlist:
+                with self.publish_lock:
+                    first = playlist not in self.publish
+                    self.publish.setdefault(playlist, set()).add(sid)
+                if first:
+                    threading.Timer(10, self.flush_publish, [playlist]).start()
+
+    def stream(self):
+        cursor = None
+        backoff = 1
+        while True:
+            try:
+                cfg, token = access_token()
+                url = "%s/stream/project?project=%s" % (api_base(cfg), project_id(cfg))
+                headers = {"Authorization": "Bearer " + token, "Accept": "text/event-stream",
+                           "User-Agent": APP}
+                if cursor:
+                    headers["Last-Event-ID"] = cursor
+                resp = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=45)
+                self.out({"kind": "status", "ok": True})
+                backoff = 1
+                event, data, ident = "message", [], None
+                for raw in resp:
+                    line = raw.decode(errors="replace").rstrip("\r\n")
+                    if line == "":
+                        if data:
+                            if ident:
+                                cursor = ident
+                            if event == "reauth":
+                                access_token(force=True)
+                                break
+                            if event == "stream.resync_required":
+                                cursor = None
+                                self.dirty.set()
+                            elif event not in ("stream.cursor", "problem"):
+                                try:
+                                    self.on_event(json.loads("\n".join(data)))
+                                except ValueError:
+                                    pass
+                        event, data, ident = "message", [], None
+                    elif line.startswith(":"):
+                        continue
+                    elif line.startswith("event:"):
+                        event = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data.append(line[5:].lstrip())
+                    elif line.startswith("id:"):
+                        ident = line[3:].strip()
+            except urllib.error.HTTPError as err:
+                if err.code == 401:
+                    try:
+                        access_token(force=True)
+                    except Problem as perr:
+                        self.out({"kind": "status", "ok": False, "error": str(perr)})
+                else:
+                    self.out({"kind": "status", "ok": False, "error": problem_message(err.code, error_body(err))})
+            except (Problem, OSError, urllib.error.URLError, http.client.HTTPException) as err:
+                self.out({"kind": "status", "ok": False, "error": str(err)})
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+    def run(self):
+        threading.Thread(target=self.snapshot_loop, daemon=True).start()
+        threading.Thread(target=self.reviews_loop, daemon=True).start()
+        self.dirty.set()
+        self.stream()
+
+
+# ----------------------------------------------------------------------- cli
+
+def flag(args, name, default=None):
+    if name in args:
+        i = args.index(name)
+        val = args[i + 1] if i + 1 < len(args) else default
+        del args[i:i + 2]
+        return val
+    return default
+
+
+def main(argv):
+    args = list(argv)
+    if not args:
+        print(__doc__.strip())
+        return 2
+    cmd = args.pop(0)
+    if cmd == "teardown":
+        # Removes the folders below, so it must not make them first.
+        emit({"ok": True, "message": teardown()})
+        return 0
+    # Screenshots, captures and logs are the person's own.
+    for folder in (CACHE, STATE):
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        os.chmod(folder, 0o700)
+    notify_result = "--notify" in args
+    if notify_result:
+        args.remove("--notify")
+    try:
+        if cmd == "serve":
+            return serve(notify_result)
+        if cmd == "follow":
+            Follower(do_notify=notify_result).run()
+            return 0
+        if cmd == "wait":
+            emit(wait_feed(int(flag(args, "--since", "-1")), float(flag(args, "--summon", "0"))))
+            return 0
+        if cmd == "notice":
+            show_notice(json.loads(args[0]))
+            return 0
+        if cmd == "live-capture":
+            return live_capture(args[0], args[1])
+        if cmd == "snapshot":
+            emit(snapshot())
+            return 0
+        if cmd == "shot":
+            path = fetch_shot(args[0], fresh="--fresh" in args)
+            emit({"ok": True, "path": path})
+            return 0
+        if cmd == "act":
+            msg = screen_action(args[0], args[1], args[2] if len(args) > 2 else None)
+        elif cmd == "send":
+            screens = [s for s in (flag(args, "--screens", "") or "").split(",") if s]
+            minutes = int(flag(args, "--minutes", "10"))
+            msg = send(screens, minutes, url=flag(args, "--url"), path=flag(args, "--file"))
+        elif cmd == "send-file":
+            summon_panel({"mode": "cast", "kind": "file", "source": "file", "path": os.path.abspath(args[0])})
+            msg = "Pick screens in the panel"
+        elif cmd == "summon":
+            summon_panel(json.loads(args[0]) if args else {})
+            msg = "Opening the panel"
+        elif cmd == "capture":
+            msg = capture()
+        elif cmd == "clip":
+            msg = clip()
+        elif cmd == "pick-file":
+            msg = pick_file()
+        elif cmd == "open":
+            msg = open_url(DASHBOARD + "/" + "/".join(args))
+        elif cmd == "projects":
+            emit({"ok": True, "projects": list_projects()})
+            return 0
+        elif cmd == "onboarding":
+            emit(onboarding())
+            return 0
+        elif cmd == "install-plugin":
+            msg = install_plugin()
+        elif cmd == "login-start":
+            emit(login_start())
+            return 0
+        elif cmd == "login-wait":
+            msg = login_wait(args[0])
+        elif cmd == "project-use":
+            msg = use_project(args[0])
+        elif cmd == "live-targets":
+            emit(live_targets())
+            return 0
+        elif cmd == "live-status":
+            emit(live_status())
+            return 0
+        elif cmd == "live-start":
+            screens = [s for s in (flag(args, "--screens", "") or "").split(",") if s]
+            msg = live_start(flag(args, "--source", ""), screens, int(flag(args, "--minutes", "60")),
+                             flag(args, "--label", "") or "Desktop")
+        elif cmd == "live-stop":
+            msg = live_stop()
+        elif cmd == "live-keepalive":
+            return live_keepalive()
+        elif cmd == "setup":
+            msg = setup()
+        elif cmd == "live-setup-status":
+            emit(live_setup_status())
+            return 0
+        elif cmd == "live-setup":
+            msg = live_setup()
+        elif cmd == "live-unsetup":
+            msg = live_unsetup()
+        else:
+            raise Problem("Unknown command %s" % cmd)
+    except Problem as err:
+        emit({"ok": False, "message": str(err)})
+        if notify_result:
+            notify("screenRIG", str(err), "normal")
+        return 1
+    emit({"ok": True, "message": msg})
+    if notify_result:
+        notify("screenRIG", msg, "low")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,17 @@
+{
+  "KPlugin": {
+    "Id": "ai.screenrig.plasma",
+    "Name": "screenRIG",
+    "Description": "Your screenRIG screens in the panel: status, screenshots, actions, live cast and cast to screens.",
+    "Icon": "video-display",
+    "Authors": [{ "Name": "screenRIG", "Email": "contact-us@screenrig.ai" }],
+    "Category": "Online Services",
+    "License": "MIT",
+    "Version": "26.11.1",
+    "Website": "https://screenrig.ai",
+    "BugReportUrl": "https://github.com/screenrig/kde/issues",
+    "EnabledByDefault": true
+  },
+  "KPackageStructure": "Plasma/Applet",
+  "X-Plasma-API-Minimum-Version": "6.0"
+}
